@@ -3,6 +3,7 @@
 **Turn Android kernel chaos into clear, actionable diagnostics in seconds.**
 
 PyTomb is a GUI application that analyzes raw Android crash data and identifies the root cause of device failures, crashes, and reboots.
+<img width="998" height="730" alt="image" src="https://github.com/user-attachments/assets/c6dca80c-32f9-49da-9998-576a373b7c97" />
 
 ## Features
 
@@ -75,7 +76,7 @@ That's it! No external dependencies required.
 
 ## Usage
 
-### Method 1: Pull Directly from Phone (NEW! 📱)
+### Method 1: Pull Directly from Phone 
 1. Connect your Android phone via USB
 2. Enable USB debugging on your phone
 3. Click **"Detect Device"**
@@ -315,5 +316,5 @@ PyTomb is a diagnostic tool. Always verify findings with professional hardware t
 
 **Made with ❤️ for Android forensic analysis**
 
-<img width="998" height="730" alt="image" src="https://github.com/user-attachments/assets/c6dca80c-32f9-49da-9998-576a373b7c97" />
+
 
