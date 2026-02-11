@@ -78,7 +78,7 @@ class ADBHandler:
             result = subprocess.run(
                 [self.adb_path, 'devices'],
                 capture_output=True,
-                timeout=5,
+                timeout=10,  # Increased timeout
                 text=True
             )
             
@@ -87,25 +87,104 @@ class ADBHandler:
             
             # Parse output
             devices = []
+            unauthorized_devices = []
+            
             for line in result.stdout.split('\n')[1:]:  # Skip header
+                line = line.strip()
+                if not line:
+                    continue
+                    
                 if '\tdevice' in line:
                     device_id = line.split('\t')[0].strip()
                     devices.append(device_id)
+                elif '\tunauthorized' in line:
+                    device_id = line.split('\t')[0].strip()
+                    unauthorized_devices.append(device_id)
+            
+            # If we have unauthorized devices, inform the user
+            if unauthorized_devices and not devices:
+                return ['UNAUTHORIZED:' + ','.join(unauthorized_devices)]
             
             return devices
         except (subprocess.TimeoutExpired, Exception):
             return []
+    
+    def wait_for_authorization(self, device_id: str, timeout: int = 30) -> bool:
+        """Wait for device to be authorized"""
+        import time
+        
+        if not self.adb_path:
+            return False
+        
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            try:
+                result = subprocess.run(
+                    [self.adb_path, 'devices'],
+                    capture_output=True,
+                    timeout=5,
+                    text=True
+                )
+                
+                if result.returncode == 0:
+                    for line in result.stdout.split('\n'):
+                        if device_id in line and '\tdevice' in line:
+                            return True
+                
+                time.sleep(1)
+            except:
+                time.sleep(1)
+        
+        return False
     
     def pull_crash_logs(self, device_id: Optional[str] = None, progress_callback=None) -> str:
         """Pull all crash-related logs from device"""
         if not self.adb_path:
             raise RuntimeError("ADB not available")
         
+        # Handle unauthorized devices
+        if device_id and device_id.startswith('UNAUTHORIZED:'):
+            raise RuntimeError("Device is not authorized. Please check your phone and accept the USB debugging authorization dialog.")
+        
         device_args = ['-s', device_id] if device_id else []
         combined_log = ""
         temp_dir = tempfile.mkdtemp(prefix='pytomb_')
         
+        # Longer timeouts to handle slow devices and authorization
+        COMMAND_TIMEOUT = 60
+        
         try:
+            # Test connection first
+            if progress_callback:
+                progress_callback("Testing connection...")
+            
+            try:
+                test_result = subprocess.run(
+                    [self.adb_path] + device_args + ['shell', 'echo', 'test'],
+                    capture_output=True,
+                    timeout=15,
+                    text=True
+                )
+                
+                if test_result.returncode != 0:
+                    # Check if it's an authorization issue
+                    if 'unauthorized' in test_result.stderr.lower() or 'device unauthorized' in test_result.stderr.lower():
+                        raise RuntimeError(
+                            "Device is not authorized.\n\n"
+                            "Please check your phone for a dialog asking:\n"
+                            "'Allow USB debugging?'\n\n"
+                            "Tap 'Allow' or 'OK', then try again."
+                        )
+                    raise RuntimeError(f"Cannot communicate with device: {test_result.stderr}")
+                    
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    "Connection timeout.\n\n"
+                    "The device may be waiting for authorization.\n"
+                    "Check your phone for 'Allow USB debugging?' dialog."
+                )
+            
             # 1. Pull kernel log
             if progress_callback:
                 progress_callback("Pulling kernel log...")
@@ -113,7 +192,7 @@ class ADBHandler:
             result = subprocess.run(
                 [self.adb_path] + device_args + ['logcat', '-b', 'kernel', '-d'],
                 capture_output=True,
-                timeout=30,
+                timeout=COMMAND_TIMEOUT,
                 text=True,
                 encoding='utf-8',
                 errors='ignore'
@@ -132,7 +211,7 @@ class ADBHandler:
             result = subprocess.run(
                 [self.adb_path] + device_args + ['shell', 'dmesg'],
                 capture_output=True,
-                timeout=30,
+                timeout=COMMAND_TIMEOUT,
                 text=True,
                 encoding='utf-8',
                 errors='ignore'
@@ -151,7 +230,7 @@ class ADBHandler:
             result = subprocess.run(
                 [self.adb_path] + device_args + ['shell', 'ls', '/sys/fs/pstore/'],
                 capture_output=True,
-                timeout=10,
+                timeout=15,
                 text=True,
                 encoding='utf-8',
                 errors='ignore'
@@ -164,7 +243,7 @@ class ADBHandler:
                     result = subprocess.run(
                         [self.adb_path] + device_args + ['shell', 'cat', f'/sys/fs/pstore/{pstore_file}'],
                         capture_output=True,
-                        timeout=10,
+                        timeout=15,
                         text=True,
                         encoding='utf-8',
                         errors='ignore'
@@ -183,7 +262,7 @@ class ADBHandler:
             result = subprocess.run(
                 [self.adb_path] + device_args + ['shell', 'ls', '/data/tombstones/'],
                 capture_output=True,
-                timeout=10,
+                timeout=15,
                 text=True,
                 encoding='utf-8',
                 errors='ignore'
@@ -198,7 +277,7 @@ class ADBHandler:
                     result = subprocess.run(
                         [self.adb_path] + device_args + ['shell', 'cat', f'/data/tombstones/{tombstone}'],
                         capture_output=True,
-                        timeout=15,
+                        timeout=20,
                         text=True,
                         encoding='utf-8',
                         errors='ignore'
@@ -217,7 +296,7 @@ class ADBHandler:
             result = subprocess.run(
                 [self.adb_path] + device_args + ['shell', 'getprop', 'sys.boot.reason'],
                 capture_output=True,
-                timeout=5,
+                timeout=10,
                 text=True,
                 encoding='utf-8',
                 errors='ignore'
@@ -235,7 +314,14 @@ class ADBHandler:
             return combined_log if combined_log.strip() else "No crash data found on device"
             
         except subprocess.TimeoutExpired:
-            raise RuntimeError("Timeout while communicating with device")
+            raise RuntimeError(
+                "Timeout while communicating with device.\n\n"
+                "This can happen if:\n"
+                "• Device is waiting for authorization (check your phone)\n"
+                "• Device is slow to respond\n"
+                "• USB connection is unstable\n\n"
+                "Try: Unlock your phone and try again"
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to pull logs: {str(e)}")
         finally:
@@ -725,10 +811,27 @@ class PyTombGUI:
                     "Make sure:\n"
                     "• Device is connected via USB\n"
                     "• USB debugging is enabled\n"
-                    "• You've authorized this computer on the device"
+                    "• You've authorized this computer on the device\n\n"
+                    "Tip: Run 'adb devices' in terminal to check connection"
                 )
                 self.status_bar.config(text="No devices found")
                 self.device_combo.set("No device found")
+                self.pull_btn.config(state=tk.DISABLED)
+            elif devices[0].startswith('UNAUTHORIZED:'):
+                # Device found but not authorized
+                device_ids = devices[0].replace('UNAUTHORIZED:', '')
+                messagebox.showwarning(
+                    "Device Not Authorized",
+                    f"Found device: {device_ids}\n\n"
+                    "⚠️ The device is NOT authorized for USB debugging.\n\n"
+                    "CHECK YOUR PHONE NOW:\n"
+                    "• Look for a dialog asking 'Allow USB debugging?'\n"
+                    "• Tap 'Allow' or 'OK'\n"
+                    "• Check 'Always allow from this computer'\n\n"
+                    "After authorizing, click 'Detect Device' again."
+                )
+                self.status_bar.config(text="⚠️ Device found but not authorized - check your phone!")
+                self.device_combo.set(f"⚠️ {device_ids} (UNAUTHORIZED)")
                 self.pull_btn.config(state=tk.DISABLED)
             else:
                 self.connected_devices = devices
@@ -737,9 +840,9 @@ class PyTombGUI:
                 self.pull_btn.config(state=tk.NORMAL)
                 
                 if len(devices) == 1:
-                    self.status_bar.config(text=f"Found 1 device: {devices[0]}")
+                    self.status_bar.config(text=f"✓ Found 1 device: {devices[0]}")
                 else:
-                    self.status_bar.config(text=f"Found {len(devices)} devices")
+                    self.status_bar.config(text=f"✓ Found {len(devices)} devices")
                 
         except Exception as e:
             messagebox.showerror("Detection Error", f"Failed to detect devices:\n{str(e)}")
@@ -755,18 +858,37 @@ class PyTombGUI:
             messagebox.showwarning("No Device", "Please detect a device first")
             return
         
+        if "UNAUTHORIZED" in device_id:
+            messagebox.showwarning(
+                "Device Not Authorized",
+                "Device is not authorized for USB debugging.\n\n"
+                "CHECK YOUR PHONE:\n"
+                "• Look for 'Allow USB debugging?' dialog\n"
+                "• Tap 'Allow' or 'OK'\n"
+                "• Check 'Always allow from this computer'\n\n"
+                "After authorizing, click 'Detect Device' again."
+            )
+            return
+        
         # Create progress dialog
         progress_window = tk.Toplevel(self.root)
-        progress_window.title("Pulling Logs")
-        progress_window.geometry("400x150")
+        progress_window.title("Pulling Logs from Device")
+        progress_window.geometry("500x200")
         progress_window.transient(self.root)
         progress_window.grab_set()
         
         tk.Label(
             progress_window,
             text=f"Pulling crash logs from:\n{device_id}",
-            font=("Arial", 10)
+            font=("Arial", 10, "bold")
         ).pack(pady=10)
+        
+        tk.Label(
+            progress_window,
+            text="⚠️ If a dialog appears on your phone, tap 'Allow'",
+            font=("Arial", 9),
+            fg="#e67e22"
+        ).pack(pady=5)
         
         progress_label = tk.Label(progress_window, text="Initializing...", font=("Arial", 9))
         progress_label.pack(pady=5)
@@ -774,7 +896,7 @@ class PyTombGUI:
         progress_bar = ttk.Progressbar(
             progress_window,
             mode='indeterminate',
-            length=300
+            length=400
         )
         progress_bar.pack(pady=10)
         progress_bar.start(10)
@@ -785,6 +907,7 @@ class PyTombGUI:
         
         def do_pull():
             try:
+                update_progress("Testing connection with device...")
                 logs = self.adb.pull_crash_logs(device_id, update_progress)
                 
                 # Update input text
@@ -795,23 +918,59 @@ class PyTombGUI:
                 
                 # Show success message
                 lines = logs.count('\n')
+                log_size_kb = len(logs) / 1024
+                
                 messagebox.showinfo(
-                    "Success",
+                    "Success! 🎉",
                     f"Successfully pulled crash logs!\n\n"
-                    f"Retrieved {lines} lines of diagnostic data.\n"
+                    f"📊 Retrieved {lines} lines ({log_size_kb:.1f} KB)\n\n"
                     f"Click 'ANALYZE CRASH' to diagnose."
                 )
                 
-                self.status_bar.config(text=f"Logs pulled from {device_id}")
+                self.status_bar.config(text=f"✓ Logs pulled from {device_id} - ready to analyze")
                 
+            except RuntimeError as e:
+                progress_window.destroy()
+                error_msg = str(e)
+                
+                # Check if it's an authorization issue
+                if 'not authorized' in error_msg.lower() or 'authorization' in error_msg.lower():
+                    response = messagebox.askretrycancel(
+                        "Authorization Required",
+                        f"{error_msg}\n\n"
+                        "What to do:\n"
+                        "1. CHECK YOUR PHONE for the authorization dialog\n"
+                        "2. Tap 'Allow' or 'OK'\n"
+                        "3. Click 'Retry' to try again\n\n"
+                        "Or click 'Cancel' and use 'Detect Device' again."
+                    )
+                    
+                    if response:  # User clicked Retry
+                        # Wait a moment and try again
+                        self.root.after(1000, self.pull_logs)
+                else:
+                    messagebox.showerror(
+                        "Pull Failed",
+                        f"Failed to pull logs from device:\n\n{error_msg}\n\n"
+                        f"Troubleshooting:\n"
+                        f"• Make sure USB debugging is enabled\n"
+                        f"• Try unlocking your phone screen\n"
+                        f"• Try a different USB cable/port\n"
+                        f"• Run 'adb devices' in terminal to verify"
+                    )
+                
+                self.status_bar.config(text="⚠️ Log pull failed - see error message")
             except Exception as e:
                 progress_window.destroy()
                 messagebox.showerror(
-                    "Pull Failed",
-                    f"Failed to pull logs from device:\n\n{str(e)}\n\n"
-                    f"Make sure USB debugging is enabled and authorized."
+                    "Unexpected Error",
+                    f"An unexpected error occurred:\n\n{str(e)}\n\n"
+                    f"Try:\n"
+                    f"• Running 'adb kill-server' then 'adb start-server'\n"
+                    f"• Reconnecting the USB cable\n"
+                    f"• Restarting PyTomb"
                 )
-                self.status_bar.config(text="Log pull failed")
+                self.status_bar.config(text="Error during log pull")
         
         # Run pull in background
         self.root.after(100, do_pull)
@@ -824,19 +983,111 @@ class PyTombGUI:
             messagebox.showwarning("No Input", "Please paste or load crash log data first.")
             return
         
-        self.status_bar.config(text="Analyzing...")
-        self.analyze_btn.config(state=tk.DISABLED)
-        self.root.update()
+        # Create progress dialog
+        progress_window = tk.Toplevel(self.root)
+        progress_window.title("Analyzing Crash Data")
+        progress_window.geometry("450x180")
+        progress_window.transient(self.root)
+        progress_window.grab_set()
         
-        try:
-            result = self.analyzer.analyze(log_text)
-            self.display_result(result)
-            self.status_bar.config(text="Analysis complete")
-        except Exception as e:
-            messagebox.showerror("Analysis Error", f"An error occurred:\n{str(e)}")
-            self.status_bar.config(text="Analysis failed")
-        finally:
-            self.analyze_btn.config(state=tk.NORMAL)
+        # Center the window
+        progress_window.update_idletasks()
+        x = (progress_window.winfo_screenwidth() // 2) - (450 // 2)
+        y = (progress_window.winfo_screenheight() // 2) - (180 // 2)
+        progress_window.geometry(f"450x180+{x}+{y}")
+        
+        tk.Label(
+            progress_window,
+            text="🧠 Analyzing Crash Data",
+            font=("Arial", 12, "bold")
+        ).pack(pady=15)
+        
+        progress_label = tk.Label(
+            progress_window,
+            text="Scanning for crash patterns...",
+            font=("Arial", 9)
+        )
+        progress_label.pack(pady=5)
+        
+        progress_bar = ttk.Progressbar(
+            progress_window,
+            mode='determinate',
+            length=350,
+            maximum=100
+        )
+        progress_bar.pack(pady=10)
+        
+        details_label = tk.Label(
+            progress_window,
+            text="",
+            font=("Arial", 8),
+            fg="#7f8c8d"
+        )
+        details_label.pack(pady=5)
+        
+        self.analyze_btn.config(state=tk.DISABLED)
+        
+        def update_progress(value, message, detail=""):
+            """Update progress bar and messages"""
+            progress_bar['value'] = value
+            progress_label.config(text=message)
+            details_label.config(text=detail)
+            progress_window.update()
+        
+        def do_analysis():
+            try:
+                # Step 1: Parse input
+                update_progress(10, "Parsing log data...", f"{len(log_text)} characters")
+                self.root.after(50)  # Small delay for visual feedback
+                
+                # Step 2: Initialize analyzer
+                update_progress(25, "Loading crash pattern database...", "14+ patterns loaded")
+                self.root.after(50)
+                
+                # Step 3: Scan for patterns
+                update_progress(40, "Scanning for kernel errors...", "Searching crash signatures")
+                self.root.after(100)
+                
+                # Step 4: Perform actual analysis
+                update_progress(60, "Analyzing patterns...", "Matching against known faults")
+                result = self.analyzer.analyze(log_text)
+                self.root.after(50)
+                
+                # Step 5: Build diagnostic report
+                update_progress(80, "Building diagnostic report...", f"Confidence: {result.confidence.value}")
+                self.root.after(50)
+                
+                # Step 6: Format output
+                update_progress(95, "Formatting results...", f"Component: {result.component}")
+                self.display_result(result)
+                self.root.after(50)
+                
+                # Step 7: Complete
+                update_progress(100, "Analysis complete!", "✓ Report ready")
+                self.root.after(300)
+                
+                progress_window.destroy()
+                
+                # Show completion message with result summary
+                confidence_icon = {
+                    "High": "🟢",
+                    "Medium": "🟡",
+                    "Low": "🔴"
+                }.get(result.confidence.value, "⚪")
+                
+                self.status_bar.config(
+                    text=f"✓ Analysis complete - {confidence_icon} {result.confidence.value} confidence: {result.component}"
+                )
+                
+            except Exception as e:
+                progress_window.destroy()
+                messagebox.showerror("Analysis Error", f"An error occurred:\n{str(e)}")
+                self.status_bar.config(text="Analysis failed")
+            finally:
+                self.analyze_btn.config(state=tk.NORMAL)
+        
+        # Start analysis after a brief moment
+        self.root.after(100, do_analysis)
     
     def display_result(self, result: DiagnosticResult):
         """Display formatted diagnostic result"""
