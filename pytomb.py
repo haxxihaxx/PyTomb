@@ -10,10 +10,23 @@ import re
 import subprocess
 import tempfile
 import os
+import sys
+import threading
+import queue
+import time
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 from enum import Enum
 from pathlib import Path
+
+# Check if running as compiled exe
+IS_FROZEN = getattr(sys, 'frozen', False)
+if IS_FROZEN:
+    # Running as compiled exe
+    APPLICATION_PATH = os.path.dirname(sys.executable)
+else:
+    # Running as script
+    APPLICATION_PATH = os.path.dirname(os.path.abspath(__file__))
 
 
 class Confidence(Enum):
@@ -36,6 +49,8 @@ class ADBHandler:
     
     def __init__(self):
         self.adb_path = self._find_adb()
+        if self.adb_path:
+            self._ensure_server_running()
     
     def _find_adb(self) -> Optional[str]:
         """Locate ADB executable"""
@@ -50,13 +65,20 @@ class ADBHandler:
             'C:\\Program Files (x86)\\Android\\android-sdk\\platform-tools\\adb.exe',
         ]
         
+        # If running as exe, check for bundled ADB
+        if IS_FROZEN:
+            bundled_adb = os.path.join(APPLICATION_PATH, 'adb.exe' if os.name == 'nt' else 'adb')
+            if os.path.exists(bundled_adb):
+                adb_locations.insert(0, bundled_adb)
+        
         for location in adb_locations:
             try:
                 result = subprocess.run(
                     [location, 'version'],
                     capture_output=True,
-                    timeout=2,
-                    text=True
+                    timeout=3,
+                    text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' and IS_FROZEN else 0
                 )
                 if result.returncode == 0:
                     return location
@@ -65,9 +87,47 @@ class ADBHandler:
         
         return None
     
+    def _ensure_server_running(self):
+        """Ensure ADB server is started (critical for exe builds)"""
+        if not self.adb_path:
+            return
+        
+        try:
+            # Kill any existing server
+            subprocess.run(
+                [self.adb_path, 'kill-server'],
+                capture_output=True,
+                timeout=3,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' and IS_FROZEN else 0
+            )
+            time.sleep(0.5)
+            
+            # Start server explicitly
+            subprocess.run(
+                [self.adb_path, 'start-server'],
+                capture_output=True,
+                timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' and IS_FROZEN else 0
+            )
+            time.sleep(0.5)
+        except:
+            pass  # Fail silently, will retry on first use
+    
     def is_available(self) -> bool:
         """Check if ADB is available"""
         return self.adb_path is not None
+    
+    def _run_adb_command(self, args: List[str], timeout: int = 10, **kwargs) -> subprocess.CompletedProcess:
+        """Run ADB command with exe-friendly flags"""
+        creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' and IS_FROZEN else 0
+        return subprocess.run(
+            args,
+            capture_output=True,
+            timeout=timeout,
+            text=True,
+            creationflags=creation_flags,
+            **kwargs
+        )
     
     def get_devices(self) -> List[str]:
         """Get list of connected devices"""
@@ -75,11 +135,9 @@ class ADBHandler:
             return []
         
         try:
-            result = subprocess.run(
+            result = self._run_adb_command(
                 [self.adb_path, 'devices'],
-                capture_output=True,
-                timeout=10,  # Increased timeout
-                text=True
+                timeout=10
             )
             
             if result.returncode != 0:
@@ -160,11 +218,9 @@ class ADBHandler:
                 progress_callback("Testing connection...")
             
             try:
-                test_result = subprocess.run(
+                test_result = self._run_adb_command(
                     [self.adb_path] + device_args + ['shell', 'echo', 'test'],
-                    capture_output=True,
-                    timeout=15,
-                    text=True
+                    timeout=15
                 )
                 
                 if test_result.returncode != 0:
@@ -189,11 +245,9 @@ class ADBHandler:
             if progress_callback:
                 progress_callback("Pulling kernel log...")
             
-            result = subprocess.run(
+            result = self._run_adb_command(
                 [self.adb_path] + device_args + ['logcat', '-b', 'kernel', '-d'],
-                capture_output=True,
                 timeout=COMMAND_TIMEOUT,
-                text=True,
                 encoding='utf-8',
                 errors='ignore'
             )
@@ -208,11 +262,9 @@ class ADBHandler:
             if progress_callback:
                 progress_callback("Pulling dmesg...")
             
-            result = subprocess.run(
+            result = self._run_adb_command(
                 [self.adb_path] + device_args + ['shell', 'dmesg'],
-                capture_output=True,
                 timeout=COMMAND_TIMEOUT,
-                text=True,
                 encoding='utf-8',
                 errors='ignore'
             )
@@ -227,11 +279,9 @@ class ADBHandler:
             if progress_callback:
                 progress_callback("Checking pstore...")
             
-            result = subprocess.run(
+            result = self._run_adb_command(
                 [self.adb_path] + device_args + ['shell', 'ls', '/sys/fs/pstore/'],
-                capture_output=True,
                 timeout=15,
-                text=True,
                 encoding='utf-8',
                 errors='ignore'
             )
@@ -240,11 +290,9 @@ class ADBHandler:
                 pstore_files = [f.strip() for f in result.stdout.split('\n') if f.strip()]
                 
                 for pstore_file in pstore_files[:5]:  # Limit to 5 files
-                    result = subprocess.run(
+                    result = self._run_adb_command(
                         [self.adb_path] + device_args + ['shell', 'cat', f'/sys/fs/pstore/{pstore_file}'],
-                        capture_output=True,
                         timeout=15,
-                        text=True,
                         encoding='utf-8',
                         errors='ignore'
                     )
@@ -259,11 +307,9 @@ class ADBHandler:
             if progress_callback:
                 progress_callback("Checking tombstones...")
             
-            result = subprocess.run(
+            result = self._run_adb_command(
                 [self.adb_path] + device_args + ['shell', 'ls', '/data/tombstones/'],
-                capture_output=True,
                 timeout=15,
-                text=True,
                 encoding='utf-8',
                 errors='ignore'
             )
@@ -274,11 +320,9 @@ class ADBHandler:
                 
                 # Get most recent tombstones (up to 3)
                 for tombstone in sorted(tombstone_files, reverse=True)[:3]:
-                    result = subprocess.run(
+                    result = self._run_adb_command(
                         [self.adb_path] + device_args + ['shell', 'cat', f'/data/tombstones/{tombstone}'],
-                        capture_output=True,
                         timeout=20,
-                        text=True,
                         encoding='utf-8',
                         errors='ignore'
                     )
@@ -293,11 +337,9 @@ class ADBHandler:
             if progress_callback:
                 progress_callback("Getting reboot reason...")
             
-            result = subprocess.run(
+            result = self._run_adb_command(
                 [self.adb_path] + device_args + ['shell', 'getprop', 'sys.boot.reason'],
-                capture_output=True,
                 timeout=10,
-                text=True,
                 encoding='utf-8',
                 errors='ignore'
             )
@@ -799,11 +841,22 @@ class PyTombGUI:
         """Detect connected Android devices"""
         self.status_bar.config(text="Scanning for devices...")
         self.detect_btn.config(state=tk.DISABLED)
-        self.root.update()
         
+        def scan_in_background():
+            """Run device scan in background thread"""
+            try:
+                devices = self.adb.get_devices()
+                # Use after() to safely update GUI from thread
+                self.root.after(0, lambda: self._handle_device_scan_result(devices))
+            except Exception as e:
+                self.root.after(0, lambda: self._handle_device_scan_error(str(e)))
+        
+        # Start scan in background thread
+        threading.Thread(target=scan_in_background, daemon=True).start()
+    
+    def _handle_device_scan_result(self, devices):
+        """Handle device scan results (runs in main thread)"""
         try:
-            devices = self.adb.get_devices()
-            
             if not devices:
                 messagebox.showinfo(
                     "No Devices Found",
@@ -843,12 +896,14 @@ class PyTombGUI:
                     self.status_bar.config(text=f"✓ Found 1 device: {devices[0]}")
                 else:
                     self.status_bar.config(text=f"✓ Found {len(devices)} devices")
-                
-        except Exception as e:
-            messagebox.showerror("Detection Error", f"Failed to detect devices:\n{str(e)}")
-            self.status_bar.config(text="Device detection failed")
         finally:
             self.detect_btn.config(state=tk.NORMAL)
+    
+    def _handle_device_scan_error(self, error_msg):
+        """Handle device scan errors (runs in main thread)"""
+        messagebox.showerror("Detection Error", f"Failed to detect devices:\n{error_msg}")
+        self.status_bar.config(text="Device detection failed")
+        self.detect_btn.config(state=tk.NORMAL)
     
     def pull_logs(self):
         """Pull crash logs from selected device"""
@@ -901,79 +956,111 @@ class PyTombGUI:
         progress_bar.pack(pady=10)
         progress_bar.start(10)
         
-        def update_progress(message):
-            progress_label.config(text=message)
-            progress_window.update()
+        # Thread-safe queue for progress updates
+        progress_queue = queue.Queue()
         
-        def do_pull():
+        def update_progress_from_queue():
+            """Check queue and update progress label (runs in main thread)"""
             try:
-                update_progress("Testing connection with device...")
-                logs = self.adb.pull_crash_logs(device_id, update_progress)
+                while True:
+                    message = progress_queue.get_nowait()
+                    progress_label.config(text=message)
+            except queue.Empty:
+                pass
+            
+            # Check again in 100ms if window still exists
+            if progress_window.winfo_exists():
+                progress_window.after(100, update_progress_from_queue)
+        
+        def progress_callback(message):
+            """Thread-safe progress callback"""
+            progress_queue.put(message)
+        
+        def pull_in_background():
+            """Pull logs in background thread"""
+            try:
+                progress_callback("Testing connection with device...")
+                logs = self.adb.pull_crash_logs(device_id, progress_callback)
                 
-                # Update input text
-                self.input_text.delete(1.0, tk.END)
-                self.input_text.insert(1.0, logs)
-                
-                progress_window.destroy()
-                
-                # Show success message
-                lines = logs.count('\n')
-                log_size_kb = len(logs) / 1024
-                
-                messagebox.showinfo(
-                    "Success! 🎉",
-                    f"Successfully pulled crash logs!\n\n"
-                    f"📊 Retrieved {lines} lines ({log_size_kb:.1f} KB)\n\n"
-                    f"Click 'ANALYZE CRASH' to diagnose."
-                )
-                
-                self.status_bar.config(text=f"✓ Logs pulled from {device_id} - ready to analyze")
+                # Use after() to safely update GUI from thread
+                self.root.after(0, lambda: self._handle_pull_success(logs, device_id, progress_window))
                 
             except RuntimeError as e:
-                progress_window.destroy()
-                error_msg = str(e)
-                
-                # Check if it's an authorization issue
-                if 'not authorized' in error_msg.lower() or 'authorization' in error_msg.lower():
-                    response = messagebox.askretrycancel(
-                        "Authorization Required",
-                        f"{error_msg}\n\n"
-                        "What to do:\n"
-                        "1. CHECK YOUR PHONE for the authorization dialog\n"
-                        "2. Tap 'Allow' or 'OK'\n"
-                        "3. Click 'Retry' to try again\n\n"
-                        "Or click 'Cancel' and use 'Detect Device' again."
-                    )
-                    
-                    if response:  # User clicked Retry
-                        # Wait a moment and try again
-                        self.root.after(1000, self.pull_logs)
-                else:
-                    messagebox.showerror(
-                        "Pull Failed",
-                        f"Failed to pull logs from device:\n\n{error_msg}\n\n"
-                        f"Troubleshooting:\n"
-                        f"• Make sure USB debugging is enabled\n"
-                        f"• Try unlocking your phone screen\n"
-                        f"• Try a different USB cable/port\n"
-                        f"• Run 'adb devices' in terminal to verify"
-                    )
-                
-                self.status_bar.config(text="⚠️ Log pull failed - see error message")
+                self.root.after(0, lambda: self._handle_pull_error(str(e), progress_window, is_auth_error='not authorized' in str(e).lower()))
             except Exception as e:
-                progress_window.destroy()
-                messagebox.showerror(
-                    "Unexpected Error",
-                    f"An unexpected error occurred:\n\n{str(e)}\n\n"
-                    f"Try:\n"
-                    f"• Running 'adb kill-server' then 'adb start-server'\n"
-                    f"• Reconnecting the USB cable\n"
-                    f"• Restarting PyTomb"
-                )
-                self.status_bar.config(text="Error during log pull")
+                self.root.after(0, lambda: self._handle_pull_unexpected_error(str(e), progress_window))
         
-        # Run pull in background
-        self.root.after(100, do_pull)
+        # Start queue checker and pull thread
+        update_progress_from_queue()
+        threading.Thread(target=pull_in_background, daemon=True).start()
+    
+    def _handle_pull_success(self, logs, device_id, progress_window):
+        """Handle successful log pull (runs in main thread)"""
+        # Update input text
+        self.input_text.delete(1.0, tk.END)
+        self.input_text.insert(1.0, logs)
+        
+        if progress_window.winfo_exists():
+            progress_window.destroy()
+        
+        # Show success message
+        lines = logs.count('\n')
+        log_size_kb = len(logs) / 1024
+        
+        messagebox.showinfo(
+            "Success! 🎉",
+            f"Successfully pulled crash logs!\n\n"
+            f"📊 Retrieved {lines} lines ({log_size_kb:.1f} KB)\n\n"
+            f"Click 'ANALYZE CRASH' to diagnose."
+        )
+        
+        self.status_bar.config(text=f"✓ Logs pulled from {device_id} - ready to analyze")
+    
+    def _handle_pull_error(self, error_msg, progress_window, is_auth_error=False):
+        """Handle pull error (runs in main thread)"""
+        if progress_window.winfo_exists():
+            progress_window.destroy()
+        
+        if is_auth_error:
+            response = messagebox.askretrycancel(
+                "Authorization Required",
+                f"{error_msg}\n\n"
+                "What to do:\n"
+                "1. CHECK YOUR PHONE for the authorization dialog\n"
+                "2. Tap 'Allow' or 'OK'\n"
+                "3. Click 'Retry' to try again\n\n"
+                "Or click 'Cancel' and use 'Detect Device' again."
+            )
+            
+            if response:  # User clicked Retry
+                self.root.after(1000, self.pull_logs)
+        else:
+            messagebox.showerror(
+                "Pull Failed",
+                f"Failed to pull logs from device:\n\n{error_msg}\n\n"
+                f"Troubleshooting:\n"
+                f"• Make sure USB debugging is enabled\n"
+                f"• Try unlocking your phone screen\n"
+                f"• Try a different USB cable/port\n"
+                f"• Run 'adb devices' in terminal to verify"
+            )
+        
+        self.status_bar.config(text="⚠️ Log pull failed - see error message")
+    
+    def _handle_pull_unexpected_error(self, error_msg, progress_window):
+        """Handle unexpected error (runs in main thread)"""
+        if progress_window.winfo_exists():
+            progress_window.destroy()
+        
+        messagebox.showerror(
+            "Unexpected Error",
+            f"An unexpected error occurred:\n\n{error_msg}\n\n"
+            f"Try:\n"
+            f"• Running 'adb kill-server' then 'adb start-server'\n"
+            f"• Reconnecting the USB cable\n"
+            f"• Restarting PyTomb"
+        )
+        self.status_bar.config(text="Error during log pull")
     
     def analyze_crash(self):
         """Perform crash analysis"""
