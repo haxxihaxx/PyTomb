@@ -53,9 +53,59 @@ class ADBHandler:
             self._ensure_server_running()
     
     def _find_adb(self) -> Optional[str]:
-        """Locate ADB executable"""
-        # Try common locations
-        adb_locations = [
+        """Locate ADB executable - prioritize bundled version"""
+        
+        # Determine platform-specific ADB filename
+        if os.name == 'nt':  # Windows
+            adb_executable = 'adb.exe'
+        else:  # Linux/macOS
+            adb_executable = 'adb'
+        
+        # Priority 1: Bundled ADB (highest priority)
+        bundled_locations = []
+        
+        if IS_FROZEN:
+            # Running as compiled .exe
+            bundled_locations = [
+                os.path.join(APPLICATION_PATH, 'adb', adb_executable),  # PyTomb.exe/adb/adb.exe
+                os.path.join(APPLICATION_PATH, adb_executable),          # PyTomb.exe/adb.exe
+                os.path.join(sys._MEIPASS, 'adb', adb_executable),      # Temp extraction folder
+                os.path.join(sys._MEIPASS, adb_executable),
+            ]
+        else:
+            # Running as script
+            bundled_locations = [
+                os.path.join(APPLICATION_PATH, 'adb', adb_executable),  # pytomb.py/adb/adb.exe
+                os.path.join(APPLICATION_PATH, adb_executable),          # pytomb.py/adb.exe
+            ]
+        
+        # Check bundled locations first
+        for location in bundled_locations:
+            if os.path.exists(location):
+                # Make executable on Unix systems
+                if os.name != 'nt':
+                    try:
+                        os.chmod(location, 0o755)
+                    except:
+                        pass
+                
+                # Verify it works
+                try:
+                    result = subprocess.run(
+                        [location, 'version'],
+                        capture_output=True,
+                        timeout=3,
+                        text=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' and IS_FROZEN else 0
+                    )
+                    if result.returncode == 0:
+                        print(f"[PyTomb] Using bundled ADB: {location}")
+                        return location
+                except:
+                    continue
+        
+        # Priority 2: System PATH and common install locations (fallback)
+        system_locations = [
             'adb',  # In PATH
             '/usr/bin/adb',
             '/usr/local/bin/adb',
@@ -65,13 +115,7 @@ class ADBHandler:
             'C:\\Program Files (x86)\\Android\\android-sdk\\platform-tools\\adb.exe',
         ]
         
-        # If running as exe, check for bundled ADB
-        if IS_FROZEN:
-            bundled_adb = os.path.join(APPLICATION_PATH, 'adb.exe' if os.name == 'nt' else 'adb')
-            if os.path.exists(bundled_adb):
-                adb_locations.insert(0, bundled_adb)
-        
-        for location in adb_locations:
+        for location in system_locations:
             try:
                 result = subprocess.run(
                     [location, 'version'],
@@ -81,10 +125,12 @@ class ADBHandler:
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' and IS_FROZEN else 0
                 )
                 if result.returncode == 0:
+                    print(f"[PyTomb] Using system ADB: {location}")
                     return location
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 continue
         
+        print("[PyTomb] ADB not found - USB features will be disabled")
         return None
     
     def _ensure_server_running(self):
@@ -393,8 +439,329 @@ class AndroidCrashAnalyzer:
         self.patterns = self._init_patterns()
     
     def _init_patterns(self) -> List[CrashPattern]:
-        """Initialize crash pattern database"""
+        """
+        Initialize comprehensive crash pattern database
+        
+        COVERAGE:
+        ========
+        Signal Errors (Most Common Native Crashes):
+          • SIGSEGV (11) - Segmentation fault / Invalid memory access
+          • SIGABRT (6) - Abort signal / Failed assertions
+          • SIGILL (4) - Illegal instruction / Wrong architecture
+          • SIGFPE (8) - Floating point exception / Division by zero
+          • SIGBUS (7) - Bus error / Misaligned memory access
+          • SIGTRAP (5) - Trace/breakpoint trap / Debug assertions
+          • SIGSTKFLT (16) - Stack fault / Stack overflow
+          • SIGPIPE (13) - Broken pipe / Write to closed socket
+        
+        Memory Errors:
+          • Heap corruption (malloc/free errors)
+          • Double free (freeing same memory twice)
+          • Use-after-free (accessing freed memory)
+          • Buffer overflow (stack/heap overruns)
+          • Out of memory (OOM)
+        
+        Thread/Synchronization Errors:
+          • Deadlocks (circular lock dependencies)
+          • Race conditions (unsynchronized access)
+          • Mutex errors (invalid lock/unlock operations)
+          • Thread stack overflow
+        
+        JNI Errors (Java Native Interface):
+          • Invalid JNI references
+          • Method signature mismatches  
+          • Uncaught exceptions crossing JNI boundary
+        
+        Library/Linking Errors:
+          • Missing shared libraries (.so files)
+          • Symbol resolution failures
+          • ABI incompatibility (wrong architecture)
+        
+        Tombstone Information:
+          • Native crash backtraces
+          • Register dumps (ARM/x86/x64)
+          • Memory maps
+          • Abort messages
+        
+        Hardware/Kernel Errors:
+          • Kernel panics
+          • Watchdog timeouts
+          • Storage errors (UFS/eMMC)
+          • GPU faults
+          • Thermal shutdowns
+          • Power management issues
+          • Modem crashes
+          • Display errors
+          • WiFi crashes
+          • Filesystem corruption
+        
+        TOTAL: 40+ patterns covering most Android crash scenarios
+        """
         return [
+            # ==================== SIGNAL ERRORS (Native Crashes) ====================
+            
+            # SIGSEGV - Segmentation Violation
+            CrashPattern(
+                r"signal 11.*SIGSEGV|SIGSEGV.*fault addr|segmentation fault|Segmentation violation",
+                "Memory subsystem (SIGSEGV)",
+                "Segmentation fault - invalid memory access detected",
+                "Critical memory error: null pointer dereference, accessing freed memory, or buffer overflow. Check native code for memory bugs. May indicate faulty RAM if persistent.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # SIGABRT - Abort Signal
+            CrashPattern(
+                r"signal 6.*SIGABRT|SIGABRT|abort\(\)|CHECK.*failed|fatal.*assertion",
+                "Runtime subsystem (SIGABRT)",
+                "Program aborted - assertion or check failure detected",
+                "Application abort: failed assertion, CHECK failure, or fatal runtime error. Review tombstone for specific assertion that failed. Usually indicates software bug.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # SIGILL - Illegal Instruction
+            CrashPattern(
+                r"signal 4.*SIGILL|SIGILL|illegal instruction|invalid opcode",
+                "CPU / Binary compatibility (SIGILL)",
+                "Illegal CPU instruction encountered",
+                "Invalid instruction: wrong architecture binary, corrupted code section, or incompatible CPU features. Verify app ABI matches device architecture.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # SIGFPE - Floating Point Exception
+            CrashPattern(
+                r"signal 8.*SIGFPE|SIGFPE|floating.?point exception|division by zero|integer overflow",
+                "Arithmetic unit (SIGFPE)",
+                "Arithmetic exception - division by zero or overflow",
+                "Math error: division by zero or integer overflow. Check arithmetic operations in native code. Software bug - requires code fix.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # SIGBUS - Bus Error
+            CrashPattern(
+                r"signal 7.*SIGBUS|SIGBUS|bus error|misaligned|unaligned access",
+                "Memory bus / Alignment (SIGBUS)",
+                "Bus error - misaligned memory access or bad address",
+                "Memory alignment issue: accessing memory at invalid alignment or unmapped address. May indicate hardware memory errors if persistent across reboots.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # SIGTRAP - Trace/Breakpoint
+            CrashPattern(
+                r"signal 5.*SIGTRAP|SIGTRAP|trap instruction|__builtin_trap",
+                "Debug subsystem (SIGTRAP)",
+                "Trap instruction hit - likely debug assertion",
+                "Debug trap: breakpoint or assertion in debug build. Check for __builtin_trap() calls or failed asserts. Normal in debug builds, investigate in release.",
+                Confidence.MEDIUM,
+                re.IGNORECASE
+            ),
+            
+            # SIGSTKFLT - Stack Fault
+            CrashPattern(
+                r"signal 16.*SIGSTKFLT|SIGSTKFLT|stack fault|stack overflow|stack.*corrupt",
+                "Stack memory (SIGSTKFLT)",
+                "Stack fault - overflow or corruption detected",
+                "Stack error: overflow from deep recursion or corrupted stack pointer. Check for infinite recursion or excessive stack allocations. Increase stack size if needed.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # SIGPIPE - Broken Pipe
+            CrashPattern(
+                r"signal 13.*SIGPIPE|SIGPIPE|broken pipe",
+                "Network/IPC subsystem (SIGPIPE)",
+                "Broken pipe - writing to closed connection",
+                "Pipe error: attempted write to closed socket or pipe. Usually indicates peer disconnected. Handle SIGPIPE or check connection status before writing.",
+                Confidence.MEDIUM,
+                re.IGNORECASE
+            ),
+            
+            # ========== MEMORY ERRORS ==========
+            
+            # Heap Corruption
+            CrashPattern(
+                r"heap corruption|corrupted.*heap|malloc.*corrupt|free.*invalid|invalid.*free",
+                "Heap memory allocator",
+                "Heap corruption detected - memory allocator integrity violated",
+                "Critical heap damage: double free, invalid free, or heap metadata corruption. Check native code for memory management bugs. Causes undefined behavior.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # Use-After-Free
+            CrashPattern(
+                r"use.?after.?free|freed memory|dangling pointer|UAF detected",
+                "Memory management (use-after-free)",
+                "Use-after-free detected - accessing freed memory",
+                "Severe memory bug: accessing memory after it was freed. Review object lifetime management. Use AddressSanitizer to locate exact bug location.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # Double Free
+            CrashPattern(
+                r"double.?free|freed.*twice|attempting to free.*already freed",
+                "Memory management (double-free)",
+                "Double-free detected - memory freed multiple times",
+                "Critical bug: same memory freed twice. Review deallocation logic and object ownership. Can lead to heap corruption and crashes.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # Buffer Overflow
+            CrashPattern(
+                r"buffer overflow|stack.*smash|__stack_chk_fail|stack.*canary",
+                "Buffer management / Stack protector",
+                "Buffer overflow detected - stack canary triggered",
+                "Buffer overrun: wrote past buffer boundary. Stack protector detected corruption. Review string operations and array bounds. Security vulnerability.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # ========== THREAD/SYNCHRONIZATION ERRORS ==========
+            
+            # Deadlock
+            CrashPattern(
+                r"deadlock|mutex.*timeout|lock.*timeout|circular.*dependency|waiting.*lock",
+                "Thread synchronization (deadlock)",
+                "Deadlock detected - threads waiting on each other",
+                "Threading issue: circular lock dependency or mutex timeout. Review lock acquisition order. Use thread analyzer tools to identify cycle.",
+                Confidence.MEDIUM,
+                re.IGNORECASE
+            ),
+            
+            # Race Condition
+            CrashPattern(
+                r"race condition|data race|ThreadSanitizer|TSAN.*race|concurrent.*modification|unsynchronized.*access",
+                "Thread synchronization (race condition)",
+                "Data race detected - unsynchronized concurrent access",
+                "Race condition: multiple threads accessing shared data without synchronization. Add proper locking, use atomics, or redesign for thread safety. Use ThreadSanitizer to locate.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # Mutex Errors
+            CrashPattern(
+                r"mutex.*error|EDEADLK|pthread_mutex.*failed|mutex.*owner.*mismatch|unlock.*not.*owner",
+                "Thread synchronization (mutex)",
+                "Mutex operation error - invalid lock/unlock operation",
+                "Mutex error: attempting to unlock mutex not owned by thread, or mutex in invalid state. Review lock/unlock pairing and ensure proper ownership.",
+                Confidence.MEDIUM,
+                re.IGNORECASE
+            ),
+            
+            # Thread Stack Overflow
+            CrashPattern(
+                r"thread.*stack overflow|pthread.*stack|thread.*exceeded.*stack",
+                "Thread stack management",
+                "Thread stack overflow - exceeded allocated stack size",
+                "Threading error: thread used more stack than allocated. Reduce local variables or increase thread stack size. Check for deep recursion in thread.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # ========== JNI ERRORS ==========
+            
+            # Invalid JNI Reference
+            CrashPattern(
+                r"JNI.*invalid|invalid.*jni|bad.*jni.*reference|JNI.*deleted|invalid.*jobject",
+                "JNI (Java Native Interface)",
+                "JNI error - invalid object reference",
+                "JNI bug: using deleted/invalid reference or wrong reference type. Check JNI local/global reference management. Use CheckJNI for detailed errors.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # JNI Exception
+            CrashPattern(
+                r"JNI.*exception|pending.*exception.*jni|uncaught.*jni|exception.*native",
+                "JNI exception handling",
+                "Uncaught exception crossed JNI boundary",
+                "JNI error: Java exception not cleared before next JNI call, or native exception crossed into Java. Check for ExceptionCheck() and ExceptionClear().",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # JNI Method Signature
+            CrashPattern(
+                r"JNI.*method.*not found|JNI.*signature.*mismatch|NoSuchMethodError.*native",
+                "JNI method resolution",
+                "JNI method signature mismatch or not found",
+                "JNI linking error: method signature doesn't match or method not found. Verify native method declarations match Java. Check for ProGuard obfuscation issues.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # ========== LIBRARY/LINKING ERRORS ==========
+            
+            # Missing Shared Library
+            CrashPattern(
+                r"cannot.*load library|library.*not found|\.so.*not found|dlopen.*failed|NEEDED.*not found",
+                "Dynamic linker / Library loader",
+                "Shared library missing or failed to load",
+                "Linker error: required .so library not found or failed to load. Check library is included in APK and matches device ABI. Verify dependencies.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # Symbol Resolution Failure
+            CrashPattern(
+                r"undefined symbol|symbol.*not found|relocation.*failed|cannot.*resolve.*symbol",
+                "Dynamic linker / Symbol resolution",
+                "Symbol resolution failed - undefined reference",
+                "Linker error: symbol not found in loaded libraries. Check library version compatibility. Verify all required libraries are loaded. May need -Wl,--no-undefined.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # ABI Incompatibility
+            CrashPattern(
+                r"ABI.*mismatch|wrong.*architecture|incompatible.*abi|x86.*arm|arm.*x86",
+                "Binary compatibility / ABI",
+                "ABI incompatibility - wrong architecture binary",
+                "Architecture mismatch: binary compiled for different CPU architecture. Ensure native libraries match device ABI (arm64-v8a, armeabi-v7a, x86, x86_64).",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # ========== TOMBSTONE-SPECIFIC PATTERNS ==========
+            
+            # Tombstone with Register Dump
+            CrashPattern(
+                r"backtrace:|tombstone_\d+|pid:\s*\d+.*tid:\s*\d+|#\d+\s+pc\s+[0-9a-f]+|Build fingerprint|ABI:",
+                "Native crash (tombstone)",
+                "Tombstone generated - native code crash with stack trace",
+                "Native crash detected. Review backtrace for crash location. Check fault address and signal code. Examine register state (r0-r15 on ARM, rax-r15 on x86) for debugging.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # Native Crash with Abort Message
+            CrashPattern(
+                r"Abort message:|FORTIFY.*detected|stack corruption detected|Fatal signal",
+                "Native crash (abort)",
+                "Native abort with diagnostic message",
+                "Native code triggered abort with message. Check abort message for specific error. Common causes: buffer overflow detected by FORTIFY, failed assertion, or stack guard violation.",
+                Confidence.HIGH,
+                re.IGNORECASE
+            ),
+            
+            # Memory Map Information
+            CrashPattern(
+                r"memory map:|/system/.*\.so|/data/.*\.so|/vendor/.*\.so",
+                "Native crash (memory map)",
+                "Memory map shows loaded libraries at crash time",
+                "Memory map available in tombstone. Useful for analyzing which libraries were loaded and at what addresses. Check for missing libraries or unexpected mappings.",
+                Confidence.MEDIUM,
+                re.IGNORECASE
+            ),
+            
+            # ========== KERNEL/HARDWARE ERRORS ==========
+            
             # Kernel panics
             CrashPattern(
                 r"Kernel panic|kernel BUG at|Unable to handle kernel",
@@ -600,26 +967,62 @@ class AndroidCrashAnalyzer:
     
     def _handle_no_match(self, log_text: str) -> DiagnosticResult:
         """Handle case where no patterns matched"""
-        # Check for some generic indicators
-        if re.search(r"reboot|restart|crash", log_text, re.IGNORECASE):
+        # Check for generic crash/reboot keywords
+        has_crash_keywords = bool(re.search(
+            r"reboot|restart|crash|panic|fault|error|exception|signal|abort",
+            log_text,
+            re.IGNORECASE
+        ))
+        
+        # Check if log is substantial (more than just empty or trivial)
+        has_content = len(log_text.strip()) > 100
+        
+        if has_crash_keywords and has_content:
+            # Has crash-like keywords but no recognizable pattern
             return DiagnosticResult(
-                summary="Device reboot detected, but specific cause unclear from provided logs",
+                summary="Device reboot or event detected, but specific cause unclear from provided logs",
                 component="Unknown - insufficient diagnostic data",
                 evidence=[
-                    "Generic reboot/crash keywords found",
-                    "No definitive hardware signature detected"
+                    "Generic crash/reboot keywords found",
+                    "No definitive hardware or software fault signature detected",
+                    "May be a minor event or incomplete log capture"
                 ],
                 confidence=Confidence.LOW,
-                action="Provide more complete logs (kernel log with -b kernel, full tombstone, or pstore data). Current data insufficient for diagnosis."
+                action="For detailed diagnosis, provide complete logs: kernel log (-b kernel), dmesg, tombstone files, or pstore data. Current data shows event but lacks specific crash signatures."
             )
-        
-        return DiagnosticResult(
-            summary="No recognizable crash pattern in provided data",
-            component="Indeterminate",
-            evidence=["No known error signatures found in input"],
-            confidence=Confidence.LOW,
-            action="Verify input contains actual crash data (kernel panic, tombstone, watchdog, etc.). Check log completeness."
-        )
+        elif has_content:
+            # Has content but no crash patterns = healthy
+            lines = log_text.count('\n') + 1
+            chars = len(log_text)
+            
+            return DiagnosticResult(
+                summary="✅ Device is HEALTHY - No faults detected",
+                component="All Systems Normal",
+                evidence=[
+                    f"📊 Analyzed {chars:,} characters ({lines:,} lines) of log data",
+                    "✅ No kernel panics detected",
+                    "✅ No signal errors (SIGSEGV, SIGABRT, SIGILL, SIGFPE, SIGBUS, etc.)",
+                    "✅ No memory errors (heap corruption, use-after-free, buffer overflow)",
+                    "✅ No thread errors (deadlocks, race conditions, mutex errors)",
+                    "✅ No JNI errors (invalid references, signature mismatches)",
+                    "✅ No library errors (missing .so files, symbol resolution failures)",
+                    "✅ No hardware faults (storage, GPU, modem, thermal)",
+                    "✅ No critical system errors present",
+                    "",
+                    "🎉 Your device appears to be operating normally!"
+                ],
+                confidence=Confidence.HIGH,
+                action="No action required - device logs show healthy operation. If you're experiencing issues, capture logs DURING the problem:\n\n• For app crashes: adb logcat -b crash\n• For system issues: adb logcat -b kernel\n• For native crashes: check /data/tombstones/\n• Or pull logs directly using PyTomb's 'Pull Logs from Device' feature."
+            )
+        else:
+            # Empty or minimal content
+            return DiagnosticResult(
+                summary="Insufficient log data for analysis",
+                component="No Data",
+                evidence=["Input contains insufficient data for diagnosis"],
+                confidence=Confidence.LOW,
+                action="Paste crash logs (kernel log, tombstone, or pstore data) to begin analysis. Use 'Pull Logs from Device' button if device is connected."
+            )
 
 
 class PyTombGUI:
