@@ -1095,12 +1095,7 @@ class PyTombGUI:
             command=self.clear_input
         ).pack(side=tk.LEFT, padx=2)
         
-        ttk.Button(
-            left_buttons,
-            text="📋 Paste Example",
-            command=self.load_example
-        ).pack(side=tk.LEFT, padx=2)
-        
+      
         # Right side - ADB controls
         adb_frame = tk.Frame(input_toolbar)
         adb_frame.pack(side=tk.RIGHT)
