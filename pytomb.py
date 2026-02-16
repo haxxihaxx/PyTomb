@@ -35,6 +35,13 @@ class Confidence(Enum):
     LOW = "Low"
 
 
+class Severity(Enum):
+    """Severity level for issues - determines if device is healthy"""
+    CRITICAL = "Critical"      # System-breaking (kernel panics, SIGSEGV, hardware failures, storage errors)
+    WARNING = "Warning"        # May cause instability (minor memory issues, non-fatal signals)
+    INFO = "Info"             # Informational only (device remains healthy)
+
+
 @dataclass
 class DiagnosticResult:
     summary: str
@@ -42,6 +49,8 @@ class DiagnosticResult:
     evidence: List[str]
     confidence: Confidence
     action: str
+    severity: Severity = Severity.CRITICAL  # Default to critical for backwards compatibility
+    device_info: Optional[dict] = None      # Optional device information
 
 
 class ADBHandler:
@@ -242,6 +251,119 @@ class ADBHandler:
         
         return False
     
+    def get_device_info(self, device_id: Optional[str] = None) -> dict:
+        """
+        Retrieve device information: battery health, software version, device model
+        
+        Returns dict with keys:
+        - battery_health: Battery health percentage (0-100)
+        - battery_level: Current battery level percentage
+        - battery_temp: Battery temperature (Celsius)
+        - android_version: Android OS version (e.g., "13")
+        - build_id: Build ID/fingerprint
+        - security_patch: Security patch level
+        - device_model: Device model name
+        - manufacturer: Device manufacturer
+        - sdk_version: Android SDK version
+        """
+        if not self.adb_path:
+            return {}
+        
+        device_args = ['-s', device_id] if device_id else []
+        info = {}
+        
+        try:
+            # Battery Information
+            result = self._run_adb_command(
+                [self.adb_path] + device_args + ['shell', 'dumpsys', 'battery'],
+                timeout=10
+            )
+            
+            if result.returncode == 0:
+                battery_text = result.stdout
+                
+                # Parse battery health (scale: 0-100, where 100 = good)
+                health_match = re.search(r'health:\s*(\d+)', battery_text, re.IGNORECASE)
+                if health_match:
+                    health_code = int(health_match.group(1))
+                    # Health codes: 1=unknown, 2=good, 3=overheat, 4=dead, 5=over_voltage, 6=failure, 7=cold
+                    health_map = {1: 50, 2: 100, 3: 60, 4: 0, 5: 40, 6: 20, 7: 70}
+                    info['battery_health'] = health_map.get(health_code, 50)
+                    info['battery_health_status'] = {1: 'Unknown', 2: 'Good', 3: 'Overheat', 
+                                                      4: 'Dead', 5: 'Over Voltage', 6: 'Failure', 
+                                                      7: 'Cold'}.get(health_code, 'Unknown')
+                
+                # Parse battery level
+                level_match = re.search(r'level:\s*(\d+)', battery_text, re.IGNORECASE)
+                if level_match:
+                    info['battery_level'] = int(level_match.group(1))
+                
+                # Parse battery temperature (in tenths of degree Celsius)
+                temp_match = re.search(r'temperature:\s*(\d+)', battery_text, re.IGNORECASE)
+                if temp_match:
+                    info['battery_temp'] = int(temp_match.group(1)) / 10.0
+            
+            # Device Model
+            result = self._run_adb_command(
+                [self.adb_path] + device_args + ['shell', 'getprop', 'ro.product.model'],
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                info['device_model'] = result.stdout.strip()
+            
+            # Manufacturer
+            result = self._run_adb_command(
+                [self.adb_path] + device_args + ['shell', 'getprop', 'ro.product.manufacturer'],
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                info['manufacturer'] = result.stdout.strip()
+            
+            # Android Version
+            result = self._run_adb_command(
+                [self.adb_path] + device_args + ['shell', 'getprop', 'ro.build.version.release'],
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                info['android_version'] = result.stdout.strip()
+            
+            # SDK Version
+            result = self._run_adb_command(
+                [self.adb_path] + device_args + ['shell', 'getprop', 'ro.build.version.sdk'],
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                info['sdk_version'] = result.stdout.strip()
+            
+            # Build ID
+            result = self._run_adb_command(
+                [self.adb_path] + device_args + ['shell', 'getprop', 'ro.build.id'],
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                info['build_id'] = result.stdout.strip()
+            
+            # Security Patch Level
+            result = self._run_adb_command(
+                [self.adb_path] + device_args + ['shell', 'getprop', 'ro.build.version.security_patch'],
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                info['security_patch'] = result.stdout.strip()
+            
+            # Build Fingerprint
+            result = self._run_adb_command(
+                [self.adb_path] + device_args + ['shell', 'getprop', 'ro.build.fingerprint'],
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                info['build_fingerprint'] = result.stdout.strip()
+        
+        except Exception as e:
+            print(f"[PyTomb] Error getting device info: {e}")
+        
+        return info
+    
     def pull_crash_logs(self, device_id: Optional[str] = None, progress_callback=None) -> str:
         """Pull all crash-related logs from device"""
         if not self.adb_path:
@@ -424,12 +546,13 @@ class ADBHandler:
 class CrashPattern:
     """Represents a crash pattern with regex and diagnostic info"""
     def __init__(self, pattern: str, component: str, summary_template: str, 
-                 action: str, confidence: Confidence, flags=0):
+                 action: str, confidence: Confidence, flags=0, severity: Severity = Severity.CRITICAL):
         self.regex = re.compile(pattern, flags)
         self.component = component
         self.summary_template = summary_template
         self.action = action
         self.confidence = confidence
+        self.severity = severity
 
 
 class AndroidCrashAnalyzer:
@@ -577,7 +700,8 @@ class AndroidCrashAnalyzer:
                 "Broken pipe - writing to closed connection",
                 "Pipe error: attempted write to closed socket or pipe. Usually indicates peer disconnected. Handle SIGPIPE or check connection status before writing.",
                 Confidence.MEDIUM,
-                re.IGNORECASE
+                re.IGNORECASE,
+                Severity.INFO  # Network disconnects are often normal
             ),
             
             # ========== MEMORY ERRORS ==========
@@ -757,7 +881,8 @@ class AndroidCrashAnalyzer:
                 "Memory map shows loaded libraries at crash time",
                 "Memory map available in tombstone. Useful for analyzing which libraries were loaded and at what addresses. Check for missing libraries or unexpected mappings.",
                 Confidence.MEDIUM,
-                re.IGNORECASE
+                re.IGNORECASE,
+                Severity.INFO  # Memory map itself is informational
             ),
             
             # ========== KERNEL/HARDWARE ERRORS ==========
@@ -879,7 +1004,8 @@ class AndroidCrashAnalyzer:
                 "Display subsystem communication error",
                 "Check for physical damage to screen. May indicate loose connector or panel failure.",
                 Confidence.MEDIUM,
-                re.IGNORECASE
+                re.IGNORECASE,
+                Severity.WARNING  # Display issues don't make device unhealthy overall
             ),
             
             # WiFi subsystem
@@ -889,7 +1015,8 @@ class AndroidCrashAnalyzer:
                 "WiFi subsystem crashed or firmware assertion failed",
                 "Toggle WiFi off/on. If persistent, WiFi hardware or firmware may need reflashing/replacement.",
                 Confidence.MEDIUM,
-                re.IGNORECASE
+                re.IGNORECASE,
+                Severity.WARNING  # WiFi crashes are recoverable, don't mark device unhealthy
             ),
             
             # Filesystem corruption
@@ -903,7 +1030,7 @@ class AndroidCrashAnalyzer:
             ),
         ]
     
-    def analyze(self, log_text: str) -> DiagnosticResult:
+    def analyze(self, log_text: str, device_info: Optional[dict] = None) -> DiagnosticResult:
         """Analyze crash log and return diagnostic result"""
         if not log_text or not log_text.strip():
             return DiagnosticResult(
@@ -911,7 +1038,8 @@ class AndroidCrashAnalyzer:
                 component="N/A",
                 evidence=["Empty input"],
                 confidence=Confidence.LOW,
-                action="Please paste crash logs (kernel log, tombstone, or pstore data) to begin analysis."
+                action="Please paste crash logs (kernel log, tombstone, or pstore data) to begin analysis.",
+                device_info=device_info
             )
         
         matches = []
@@ -925,7 +1053,14 @@ class AndroidCrashAnalyzer:
                 matches.append((pattern, match, evidence_lines))
         
         if not matches:
-            return self._handle_no_match(log_text)
+            return self._handle_no_match(log_text, device_info)
+        
+        # Check if only non-critical issues found
+        all_non_critical = all(m[0].severity != Severity.CRITICAL for m in matches)
+        
+        if all_non_critical:
+            # Device is healthy despite minor issues
+            return self._handle_healthy_with_warnings(log_text, matches, device_info)
         
         # Use highest confidence match
         best_match = max(matches, key=lambda x: self._confidence_score(x[0].confidence))
@@ -946,7 +1081,9 @@ class AndroidCrashAnalyzer:
             component=pattern.component,
             evidence=evidence,
             confidence=pattern.confidence,
-            action=pattern.action
+            action=pattern.action,
+            severity=pattern.severity,
+            device_info=device_info
         )
     
     def _extract_evidence(self, log_text: str, match) -> List[str]:
@@ -965,7 +1102,93 @@ class AndroidCrashAnalyzer:
         scores = {Confidence.HIGH: 3, Confidence.MEDIUM: 2, Confidence.LOW: 1}
         return scores.get(confidence, 0)
     
-    def _handle_no_match(self, log_text: str) -> DiagnosticResult:
+    def _handle_healthy_with_warnings(self, log_text: str, matches: List, device_info: Optional[dict]) -> DiagnosticResult:
+        """Handle case where only non-critical (WARNING/INFO) issues found"""
+        lines = log_text.count('\n') + 1
+        chars = len(log_text)
+        
+        # Build evidence list with device info
+        evidence = [
+            f"📊 Analyzed {chars:,} characters ({lines:,} lines) of log data",
+            "✅ No critical system errors detected",
+            "",
+            "⚠️  Minor issues found (device remains healthy):"
+        ]
+        
+        # Add non-critical issues
+        for pattern, match, _ in matches[:3]:  # Show up to 3 minor issues
+            severity_icon = "ℹ️" if pattern.severity == Severity.INFO else "⚠️"
+            evidence.append(f"  {severity_icon} {pattern.component}: {pattern.summary_template[:60]}...")
+        
+        if len(matches) > 3:
+            evidence.append(f"  ... and {len(matches) - 3} more minor issues")
+        
+        evidence.extend([
+            "",
+            "✅ Device hardware is functioning normally",
+            "✅ No system-critical failures present",
+            "🎉 Your device is HEALTHY overall!"
+        ])
+        
+        # Add device info if available
+        if device_info:
+            evidence.extend(self._format_device_info(device_info))
+        
+        return DiagnosticResult(
+            summary="✅ Device is HEALTHY (minor issues noted)",
+            component="Overall System Health: Good",
+            evidence=evidence,
+            confidence=Confidence.HIGH,
+            action="Minor issues detected but device remains healthy and functional. Monitor these issues but no immediate action required.",
+            severity=Severity.INFO,  # Overall healthy
+            device_info=device_info
+        )
+    
+    def _format_device_info(self, device_info: dict) -> List[str]:
+        """Format device info for display"""
+        info_lines = ["", "📱 Device Information:"]
+        
+        if 'device_model' in device_info or 'manufacturer' in device_info:
+            model = device_info.get('device_model', 'Unknown')
+            manufacturer = device_info.get('manufacturer', '')
+            if manufacturer:
+                info_lines.append(f"  • Device: {manufacturer} {model}")
+            else:
+                info_lines.append(f"  • Device: {model}")
+        
+        if 'android_version' in device_info:
+            android_ver = device_info['android_version']
+            sdk_ver = device_info.get('sdk_version', '')
+            if sdk_ver:
+                info_lines.append(f"  • Android: {android_ver} (API {sdk_ver})")
+            else:
+                info_lines.append(f"  • Android: {android_ver}")
+        
+        if 'build_id' in device_info:
+            info_lines.append(f"  • Build: {device_info['build_id']}")
+        
+        if 'security_patch' in device_info:
+            info_lines.append(f"  • Security Patch: {device_info['security_patch']}")
+        
+        if 'battery_health' in device_info:
+            health_pct = device_info['battery_health']
+            health_status = device_info.get('battery_health_status', 'Unknown')
+            battery_emoji = "🟢" if health_pct >= 80 else "🟡" if health_pct >= 50 else "🔴"
+            info_lines.append(f"  • Battery Health: {battery_emoji} {health_pct}% ({health_status})")
+        
+        if 'battery_level' in device_info:
+            level = device_info['battery_level']
+            level_emoji = "🔋" if level >= 20 else "🪫"
+            info_lines.append(f"  • Battery Level: {level_emoji} {level}%")
+        
+        if 'battery_temp' in device_info:
+            temp = device_info['battery_temp']
+            temp_emoji = "🌡️"  if temp < 45 else "🔥"
+            info_lines.append(f"  • Battery Temp: {temp_emoji} {temp:.1f}°C")
+        
+        return info_lines
+    
+    def _handle_no_match(self, log_text: str, device_info: Optional[dict] = None) -> DiagnosticResult:
         """Handle case where no patterns matched"""
         # Check for generic crash/reboot keywords
         has_crash_keywords = bool(re.search(
@@ -988,31 +1211,39 @@ class AndroidCrashAnalyzer:
                     "May be a minor event or incomplete log capture"
                 ],
                 confidence=Confidence.LOW,
-                action="For detailed diagnosis, provide complete logs: kernel log (-b kernel), dmesg, tombstone files, or pstore data. Current data shows event but lacks specific crash signatures."
+                action="For detailed diagnosis, provide complete logs: kernel log (-b kernel), dmesg, tombstone files, or pstore data. Current data shows event but lacks specific crash signatures.",
+                device_info=device_info
             )
         elif has_content:
             # Has content but no crash patterns = healthy
             lines = log_text.count('\n') + 1
             chars = len(log_text)
             
+            evidence = [
+                f"📊 Analyzed {chars:,} characters ({lines:,} lines) of log data",
+                "✅ No kernel panics detected",
+                "✅ No signal errors (SIGSEGV, SIGABRT, SIGILL, SIGFPE, SIGBUS, etc.)",
+                "✅ No memory errors (heap corruption, use-after-free, buffer overflow)",
+                "✅ No thread errors (deadlocks, race conditions, mutex errors)",
+                "✅ No JNI errors (invalid references, signature mismatches)",
+                "✅ No library errors (missing .so files, symbol resolution failures)",
+                "✅ No hardware faults (storage, GPU, modem, thermal)",
+                "✅ No critical system errors present",
+                "",
+                "🎉 Your device appears to be operating normally!"
+            ]
+            
+            # Add device info if available
+            if device_info:
+                evidence.extend(self._format_device_info(device_info))
+            
             return DiagnosticResult(
                 summary="✅ Device is HEALTHY - No faults detected",
                 component="All Systems Normal",
-                evidence=[
-                    f"📊 Analyzed {chars:,} characters ({lines:,} lines) of log data",
-                    "✅ No kernel panics detected",
-                    "✅ No signal errors (SIGSEGV, SIGABRT, SIGILL, SIGFPE, SIGBUS, etc.)",
-                    "✅ No memory errors (heap corruption, use-after-free, buffer overflow)",
-                    "✅ No thread errors (deadlocks, race conditions, mutex errors)",
-                    "✅ No JNI errors (invalid references, signature mismatches)",
-                    "✅ No library errors (missing .so files, symbol resolution failures)",
-                    "✅ No hardware faults (storage, GPU, modem, thermal)",
-                    "✅ No critical system errors present",
-                    "",
-                    "🎉 Your device appears to be operating normally!"
-                ],
+                evidence=evidence,
                 confidence=Confidence.HIGH,
-                action="No action required - device logs show healthy operation. If you're experiencing issues, capture logs DURING the problem:\n\n• For app crashes: adb logcat -b crash\n• For system issues: adb logcat -b kernel\n• For native crashes: check /data/tombstones/\n• Or pull logs directly using PyTomb's 'Pull Logs from Device' feature."
+                action="No action required - device logs show healthy operation. If you're experiencing issues, capture logs DURING the problem:\n\n• For app crashes: adb logcat -b crash\n• For system issues: adb logcat -b kernel\n• For native crashes: check /data/tombstones/\n• Or pull logs directly using PyTomb's 'Pull Logs from Device' feature.",
+                device_info=device_info
             )
         else:
             # Empty or minimal content
@@ -1021,7 +1252,8 @@ class AndroidCrashAnalyzer:
                 component="No Data",
                 evidence=["Input contains insufficient data for diagnosis"],
                 confidence=Confidence.LOW,
-                action="Paste crash logs (kernel log, tombstone, or pstore data) to begin analysis. Use 'Pull Logs from Device' button if device is connected."
+                action="Paste crash logs (kernel log, tombstone, or pstore data) to begin analysis. Use 'Pull Logs from Device' button if device is connected.",
+                device_info=device_info
             )
 
 
@@ -1036,6 +1268,7 @@ class PyTombGUI:
         self.analyzer = AndroidCrashAnalyzer()
         self.adb = ADBHandler()
         self.connected_devices = []
+        self.device_info = None  # Store device information
         
         self.setup_ui()
         self.check_adb_status()
@@ -1095,7 +1328,12 @@ class PyTombGUI:
             command=self.clear_input
         ).pack(side=tk.LEFT, padx=2)
         
-      
+        ttk.Button(
+            left_buttons,
+            text="📋 Paste Example",
+            command=self.load_example
+        ).pack(side=tk.LEFT, padx=2)
+        
         # Right side - ADB controls
         adb_frame = tk.Frame(input_toolbar)
         adb_frame.pack(side=tk.RIGHT)
@@ -1123,6 +1361,14 @@ class PyTombGUI:
             state=tk.DISABLED
         )
         self.pull_btn.pack(side=tk.LEFT, padx=2)
+        
+        self.device_info_btn = ttk.Button(
+            adb_frame,
+            text="📊 Get Device Info",
+            command=self.fetch_device_info,
+            state=tk.DISABLED
+        )
+        self.device_info_btn.pack(side=tk.LEFT, padx=2)
         
         self.input_text = scrolledtext.ScrolledText(
             input_frame,
@@ -1268,6 +1514,7 @@ class PyTombGUI:
                 self.status_bar.config(text="No devices found")
                 self.device_combo.set("No device found")
                 self.pull_btn.config(state=tk.DISABLED)
+                self.device_info_btn.config(state=tk.DISABLED)
             elif devices[0].startswith('UNAUTHORIZED:'):
                 # Device found but not authorized
                 device_ids = devices[0].replace('UNAUTHORIZED:', '')
@@ -1284,11 +1531,13 @@ class PyTombGUI:
                 self.status_bar.config(text="⚠️ Device found but not authorized - check your phone!")
                 self.device_combo.set(f"⚠️ {device_ids} (UNAUTHORIZED)")
                 self.pull_btn.config(state=tk.DISABLED)
+                self.device_info_btn.config(state=tk.DISABLED)
             else:
                 self.connected_devices = devices
                 self.device_combo['values'] = devices
                 self.device_combo.current(0)
                 self.pull_btn.config(state=tk.NORMAL)
+                self.device_info_btn.config(state=tk.NORMAL)  # Enable device info button
                 
                 if len(devices) == 1:
                     self.status_bar.config(text=f"✓ Found 1 device: {devices[0]}")
@@ -1380,8 +1629,12 @@ class PyTombGUI:
                 progress_callback("Testing connection with device...")
                 logs = self.adb.pull_crash_logs(device_id, progress_callback)
                 
+                # Fetch device information
+                progress_callback("Retrieving device information...")
+                device_info = self.adb.get_device_info(device_id)
+                
                 # Use after() to safely update GUI from thread
-                self.root.after(0, lambda: self._handle_pull_success(logs, device_id, progress_window))
+                self.root.after(0, lambda: self._handle_pull_success(logs, device_id, device_info, progress_window))
                 
             except RuntimeError as e:
                 self.root.after(0, lambda: self._handle_pull_error(str(e), progress_window, is_auth_error='not authorized' in str(e).lower()))
@@ -1392,8 +1645,11 @@ class PyTombGUI:
         update_progress_from_queue()
         threading.Thread(target=pull_in_background, daemon=True).start()
     
-    def _handle_pull_success(self, logs, device_id, progress_window):
+    def _handle_pull_success(self, logs, device_id, device_info, progress_window):
         """Handle successful log pull (runs in main thread)"""
+        # Store device info
+        self.device_info = device_info
+        
         # Update input text
         self.input_text.delete(1.0, tk.END)
         self.input_text.insert(1.0, logs)
@@ -1405,9 +1661,16 @@ class PyTombGUI:
         lines = logs.count('\n')
         log_size_kb = len(logs) / 1024
         
+        # Add device info to message
+        device_name = "device"
+        if device_info and 'device_model' in device_info:
+            manufacturer = device_info.get('manufacturer', '')
+            model = device_info['device_model']
+            device_name = f"{manufacturer} {model}".strip()
+        
         messagebox.showinfo(
             "Success! 🎉",
-            f"Successfully pulled crash logs!\n\n"
+            f"Successfully pulled crash logs from {device_name}!\n\n"
             f"📊 Retrieved {lines} lines ({log_size_kb:.1f} KB)\n\n"
             f"Click 'ANALYZE CRASH' to diagnose."
         )
@@ -1459,6 +1722,101 @@ class PyTombGUI:
             f"• Restarting PyTomb"
         )
         self.status_bar.config(text="Error during log pull")
+    
+    def fetch_device_info(self):
+        """Fetch device information from connected device"""
+        device_id = self.device_var.get()
+        
+        if not device_id or device_id == "No device selected" or device_id == "No device found":
+            messagebox.showwarning("No Device", "Please detect a device first")
+            return
+        
+        if "UNAUTHORIZED" in device_id:
+            messagebox.showwarning(
+                "Device Not Authorized",
+                "Device is not authorized for USB debugging.\n\n"
+                "CHECK YOUR PHONE:\n"
+                "• Look for 'Allow USB debugging?' dialog\n"
+                "• Tap 'Allow' or 'OK'\n\n"
+                "After authorizing, click 'Detect Device' again."
+            )
+            return
+        
+        # Create progress dialog
+        progress_window = tk.Toplevel(self.root)
+        progress_window.title("Fetching Device Information")
+        progress_window.geometry("400x150")
+        progress_window.transient(self.root)
+        progress_window.grab_set()
+        
+        tk.Label(
+            progress_window,
+            text="📊 Retrieving device information...",
+            font=("Arial", 10, "bold")
+        ).pack(pady=15)
+        
+        progress_bar = ttk.Progressbar(
+            progress_window,
+            mode='indeterminate',
+            length=300
+        )
+        progress_bar.pack(pady=10)
+        progress_bar.start(10)
+        
+        def fetch_in_background():
+            """Fetch device info in background thread"""
+            try:
+                device_info = self.adb.get_device_info(device_id)
+                
+                # Use after() to safely update GUI from thread
+                self.root.after(0, lambda: self._handle_device_info_success(device_info, device_id, progress_window))
+                
+            except Exception as e:
+                self.root.after(0, lambda: self._handle_device_info_error(str(e), progress_window))
+        
+        # Start fetch thread
+        threading.Thread(target=fetch_in_background, daemon=True).start()
+    
+    def _handle_device_info_success(self, device_info, device_id, progress_window):
+        """Handle successful device info fetch (runs in main thread)"""
+        # Store device info
+        self.device_info = device_info
+        
+        if progress_window.winfo_exists():
+            progress_window.destroy()
+        
+        # Build info message
+        manufacturer = device_info.get('manufacturer', 'Unknown')
+        model = device_info.get('device_model', 'Unknown')
+        android_ver = device_info.get('android_version', 'Unknown')
+        battery_health = device_info.get('battery_health', 'Unknown')
+        battery_level = device_info.get('battery_level', 'Unknown')
+        
+        message = f"Device Information Retrieved! ✅\n\n"
+        message += f"📱 Device: {manufacturer} {model}\n"
+        message += f"🤖 Android: {android_ver}\n"
+        message += f"🔋 Battery Health: {battery_health}%\n"
+        message += f"🔋 Battery Level: {battery_level}%\n\n"
+        message += "Device info will now be included in crash analysis results."
+        
+        messagebox.showinfo("Device Info Retrieved", message)
+        
+        self.status_bar.config(text=f"✓ Device info retrieved from {manufacturer} {model}")
+    
+    def _handle_device_info_error(self, error_msg, progress_window):
+        """Handle device info fetch error (runs in main thread)"""
+        if progress_window.winfo_exists():
+            progress_window.destroy()
+        
+        messagebox.showerror(
+            "Failed to Get Device Info",
+            f"Could not retrieve device information:\n\n{error_msg}\n\n"
+            f"Make sure:\n"
+            f"• Device is properly connected\n"
+            f"• USB debugging is enabled\n"
+            f"• Device is authorized"
+        )
+        self.status_bar.config(text="⚠️ Failed to get device info")
     
     def analyze_crash(self):
         """Perform crash analysis"""
@@ -1535,7 +1893,7 @@ class PyTombGUI:
                 
                 # Step 4: Perform actual analysis
                 update_progress(60, "Analyzing patterns...", "Matching against known faults")
-                result = self.analyzer.analyze(log_text)
+                result = self.analyzer.analyze(log_text, self.device_info)
                 self.root.after(50)
                 
                 # Step 5: Build diagnostic report
@@ -1576,7 +1934,93 @@ class PyTombGUI:
     
     def display_result(self, result: DiagnosticResult):
         """Display formatted diagnostic result"""
+        
+        # Determine health status based on severity
+        if result.severity == Severity.CRITICAL:
+            health_emoji = "❌"
+            health_status = "CRITICAL ISSUE DETECTED"
+        elif result.severity == Severity.WARNING:
+            health_emoji = "⚠️"
+            health_status = "DEVICE HEALTHY (minor warnings)"
+        else:  # INFO
+            health_emoji = "ℹ️"
+            health_status = "DEVICE HEALTHY (informational)"
+        
         output = f"""
+{health_emoji} Device Status: {health_status}
+"""
+        
+        # ========== DEVICE INFORMATION FIRST ==========
+        if result.device_info:
+            output += "\n" + "=" * 50 + "\n"
+            output += "📱 DEVICE INFORMATION\n"
+            output += "=" * 50 + "\n"
+            
+            info = result.device_info
+            
+            # Device Model & Manufacturer
+            if 'device_model' in info or 'manufacturer' in info:
+                manufacturer = info.get('manufacturer', '')
+                model = info.get('device_model', 'Unknown')
+                if manufacturer:
+                    output += f"\n🔹 Device: {manufacturer} {model}"
+                else:
+                    output += f"\n🔹 Device: {model}"
+            
+            # Software Information
+            if 'android_version' in info:
+                android_ver = info['android_version']
+                sdk = info.get('sdk_version', '')
+                if sdk:
+                    output += f"\n🔹 Android: {android_ver} (API {sdk})"
+                else:
+                    output += f"\n🔹 Android: {android_ver}"
+            
+            if 'build_id' in info:
+                output += f"\n🔹 Build: {info['build_id']}"
+            
+            if 'security_patch' in info:
+                output += f"\n🔹 Security Patch: {info['security_patch']}"
+            
+            # Battery Information
+            if 'battery_health' in info:
+                health_pct = info['battery_health']
+                health_status_text = info.get('battery_health_status', 'Unknown')
+                
+                if health_pct >= 80:
+                    battery_emoji = "🟢"
+                    battery_condition = "Good"
+                elif health_pct >= 50:
+                    battery_emoji = "🟡"
+                    battery_condition = "Fair"
+                else:
+                    battery_emoji = "🔴"
+                    battery_condition = "Poor"
+                
+                output += f"\n\n🔋 Battery Health: {battery_emoji} {health_pct}% ({health_status_text})"
+                
+                if health_pct < 80:
+                    output += f"\n   ⚠️ Battery condition: {battery_condition} - may contribute to instability"
+            
+            if 'battery_level' in info:
+                level = info['battery_level']
+                level_emoji = "🔋" if level >= 20 else "🪫"
+                output += f"\n🔋 Battery Level: {level_emoji} {level}%"
+            
+            if 'battery_temp' in info:
+                temp = info['battery_temp']
+                if temp < 45:
+                    temp_emoji = "🌡️"
+                    temp_status = "Normal"
+                else:
+                    temp_emoji = "🔥"
+                    temp_status = "High"
+                output += f"\n🌡️  Battery Temp: {temp_emoji} {temp:.1f}°C ({temp_status})"
+            
+            output += "\n\n" + "=" * 50 + "\n"
+        
+        # ========== NOW CRASH ANALYSIS ==========
+        output += f"""
 🧠 Crash Summary
 {result.summary}
 
@@ -1592,9 +2036,30 @@ class PyTombGUI:
 🎯 Confidence
 {result.confidence.value}
 
+⚖️ Severity
+{result.severity.value}
+
 🛠 Recommended Action
 {result.action}
 """
+        
+        # If no device info, show note at the end
+        if not result.device_info:
+            output += "\n" + "=" * 50 + "\n"
+            output += "📱 DEVICE INFORMATION\n"
+            output += "=" * 50 + "\n"
+            output += "\nℹ️  Device information not available\n\n"
+            
+            if self.connected_devices:
+                output += "💡 TIP: Click '📊 Get Device Info' button to retrieve:\n"
+                output += "   • Battery health percentage\n"
+                output += "   • Device model and manufacturer\n"
+                output += "   • Android version and build info\n"
+            else:
+                output += "💡 TIP: Use '📱 Pull Logs from Device' to automatically\n"
+                output += "   include device information with crash analysis, or\n"
+                output += "   connect a device and click '📊 Get Device Info'\n"
+            output += "\n"
         
         self.output_text.delete(1.0, tk.END)
         self.output_text.insert(1.0, output)
@@ -1610,11 +2075,14 @@ class PyTombGUI:
         self.output_text.tag_config("confidence_high", foreground="#98c379")
         self.output_text.tag_config("confidence_medium", foreground="#e5c07b")
         self.output_text.tag_config("confidence_low", foreground="#e06c75")
+        self.output_text.tag_config("critical", foreground="#e06c75", font=("Consolas", 10, "bold"))
+        self.output_text.tag_config("warning", foreground="#e5c07b", font=("Consolas", 10, "bold"))
+        self.output_text.tag_config("info", foreground="#61afef", font=("Consolas", 10, "bold"))
         
         content = self.output_text.get(1.0, tk.END)
         
         # Highlight emojis and headers
-        for emoji in ["🧠", "🔧", "📌", "🎯", "🛠"]:
+        for emoji in ["🧠", "🔧", "📌", "🎯", "🛠", "⚖️", "📱", "🔹", "🔋", "🌡️", "❌", "⚠️", "ℹ️", "🟢", "🟡", "🔴", "🪫", "🔥"]:
             start = "1.0"
             while True:
                 start = self.output_text.search(emoji, start, tk.END)
@@ -1637,6 +2105,20 @@ class PyTombGUI:
             start = self.output_text.search("Low", "1.0", tk.END)
             if start:
                 self.output_text.tag_add("confidence_low", start, f"{start}+3c")
+        
+        # Highlight severity levels
+        if "Critical" in content:
+            start = self.output_text.search("Critical", "1.0", tk.END)
+            if start:
+                self.output_text.tag_add("critical", start, f"{start}+8c")
+        if "Warning" in content:
+            start = self.output_text.search("Warning", "1.0", tk.END)
+            if start:
+                self.output_text.tag_add("warning", start, f"{start}+7c")
+        if "Info" in content:
+            start = self.output_text.search("Info", "1.0", tk.END)
+            if start:
+                self.output_text.tag_add("info", start, f"{start}+4c")
 
 
 def main():
