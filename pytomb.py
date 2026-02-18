@@ -15,9 +15,8 @@ import threading
 import queue
 import time
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List,Optional
 from enum import Enum
-from pathlib import Path
 
 # Check if running as compiled exe
 IS_FROZEN = getattr(sys, 'frozen', False)
@@ -1257,13 +1256,45 @@ class AndroidCrashAnalyzer:
             )
 
 
+class RoundedFrame(tk.Canvas):
+    """A Canvas-based frame that draws a rounded rectangle background."""
+
+    def __init__(self, parent, bg_color="#1f1e1f", radius=12, **kwargs):
+        # Remove geometry/pack kwargs that Canvas doesn't accept
+        super().__init__(parent, bg=parent.cget("bg"), highlightthickness=0, **kwargs)
+        self._bg_color = bg_color
+        self._radius = radius
+        self.bind("<Configure>", self._redraw)
+        # Inner frame where children are placed
+        self.inner = tk.Frame(self, bg=bg_color)
+        self.create_window(0, 0, anchor="nw", window=self.inner, tags="inner_win")
+
+    def _redraw(self, event=None):
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 2 or h < 2:
+            return
+        r = self._radius
+        self.delete("bg_shape")
+        # Draw rounded rectangle using arcs + rectangles
+        self.create_arc(0, 0, r*2, r*2, start=90, extent=90, fill=self._bg_color, outline=self._bg_color, tags="bg_shape")
+        self.create_arc(w-r*2, 0, w, r*2, start=0, extent=90, fill=self._bg_color, outline=self._bg_color, tags="bg_shape")
+        self.create_arc(0, h-r*2, r*2, h, start=180, extent=90, fill=self._bg_color, outline=self._bg_color, tags="bg_shape")
+        self.create_arc(w-r*2, h-r*2, w, h, start=270, extent=90, fill=self._bg_color, outline=self._bg_color, tags="bg_shape")
+        self.create_rectangle(r, 0, w-r, h, fill=self._bg_color, outline=self._bg_color, tags="bg_shape")
+        self.create_rectangle(0, r, w, h-r, fill=self._bg_color, outline=self._bg_color, tags="bg_shape")
+        # Resize inner frame to fill canvas
+        self.itemconfig("inner_win", width=w, height=h)
+        self.tag_lower("bg_shape")
+
+
 class PyTombGUI:
     """Main GUI application"""
     
     def __init__(self, root):
         self.root = root
         self.root.title("PyTomb - Android Crash Diagnostics")
-        self.root.geometry("1000x700")
+        self.root.geometry("1080x750")  # Match template size
+        self.root.minsize(1080, 750)  # Set minimum size
         
         self.analyzer = AndroidCrashAnalyzer()
         self.adb = ADBHandler()
@@ -1274,159 +1305,298 @@ class PyTombGUI:
         self.check_adb_status()
         
     def setup_ui(self):
-        """Build the user interface"""
-        # Configure style
+        """Build the user interface with modern dark theme - ALL ISSUES FIXED"""
+        
+        # Set window background color
+        self.root.configure(bg="#262526")
+        
+        # Modern font
+        self.modern_font = ("Segoe UI", 10)
+        self.title_font = ("Segoe UI", 36, "bold")
+        self.subtitle_font = ("Segoe UI", 11)
+        # FIX: Use "Segoe UI Emoji" so emoji characters render in full color
+        self.button_font = ("Segoe UI Emoji", 10)
+        self.mono_font = ("Consolas", 9)
+        
+        # Configure ttk styles
         style = ttk.Style()
         style.theme_use('clam')
         
-        # Header
-        header_frame = tk.Frame(self.root, bg="#2c3e50", height=60)
-        header_frame.pack(fill=tk.X)
+        # FIX #2: Completely configure dark combobox
+        style.configure(
+            "Dark.TCombobox",
+            fieldbackground="#1f1e1f",
+            background="#1f1e1f",
+            foreground="white",
+            arrowcolor="white",
+            bordercolor="#1f1e1f",
+            lightcolor="#1f1e1f",
+            darkcolor="#1f1e1f",
+            insertcolor="white"
+        )
+        
+        style.map('Dark.TCombobox',
+            fieldbackground=[('readonly', '#1f1e1f'), ('disabled', '#1a1a1a')],
+            background=[('readonly', '#1f1e1f'), ('disabled', '#1a1a1a')],
+            foreground=[('readonly', 'white'), ('disabled', '#666666')],
+            arrowcolor=[('disabled', '#666666')]
+        )
+        
+        # Dropdown list colors
+        self.root.option_add('*TCombobox*Listbox.background', '#1f1e1f')
+        self.root.option_add('*TCombobox*Listbox.foreground', 'white')
+        self.root.option_add('*TCombobox*Listbox.selectBackground', '#662d91')
+        self.root.option_add('*TCombobox*Listbox.selectForeground', 'white')
+        
+        # ========== HEADER ==========
+        # FIX #4: Simulate rounded corners with padding
+        
+        header_outer = tk.Frame(self.root, bg="#262526")
+        header_outer.pack(fill=tk.X, padx=12, pady=(14, 10))
+
+        header_rf = RoundedFrame(header_outer, bg_color="#1f1e1f", radius=14, height=95)
+        header_rf.pack(fill=tk.X)
+        header_frame = header_rf.inner
         header_frame.pack_propagate(False)
+        header_rf.update_idletasks()
         
         title_label = tk.Label(
             header_frame,
-            text="🪦 PyTomb",
-            font=("Arial", 20, "bold"),
-            bg="#2c3e50",
-            fg="white"
+            text="PyTomb",
+            font=self.title_font,
+            bg="#1f1e1f",
+            fg="#662d91"
         )
-        title_label.pack(side=tk.LEFT, padx=20, pady=10)
+        title_label.pack(side=tk.LEFT, padx=24, pady=20)
         
         subtitle_label = tk.Label(
             header_frame,
             text="Android Crash Forensics",
-            font=("Arial", 10),
-            bg="#2c3e50",
-            fg="#95a5a6"
+            font=self.subtitle_font,
+            bg="#1f1e1f",
+            fg="white"
         )
-        subtitle_label.pack(side=tk.LEFT, pady=10)
+        subtitle_label.place(x=240, y=37)
         
-        # Main container
-        main_container = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # ========== INPUT SECTION ==========
+        # FIX #1: Consistent 19px padding for labels, 40px for content
         
-        # Input section
-        input_frame = ttk.LabelFrame(main_container, text="📥 Crash Log Input", padding=10)
+        input_label = tk.Label(
+            self.root,
+            text="Crash Log Input",
+            font=("Segoe UI", 12),
+            bg="#262526",
+            fg="white"
+        )
+        input_label.pack(anchor=tk.W, padx=19, pady=(10, 5))
         
-        input_toolbar = tk.Frame(input_frame)
-        input_toolbar.pack(fill=tk.X, pady=(0, 5))
+        # Button toolbar - single unified row, no gap between left and right groups
+        button_outer = tk.Frame(self.root, bg="#262526", height=42)
+        button_outer.pack(fill=tk.X, padx=10, pady=(0, 10))
+        button_outer.pack_propagate(False)
+
+        # All buttons in one unified left-packed frame — zero gap between any of them
+        left_frame = tk.Frame(button_outer, bg="#262526")
+        left_frame.pack(side=tk.LEFT, fill=tk.Y)
+
+        # Combobox anchored to the far right edge on its own
+        combo_frame = tk.Frame(button_outer, bg="#262526")
+        combo_frame.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # right_frame is just an alias so button code below still works unchanged
+        right_frame = left_frame
+        
+        # Button creator
+        def create_dark_button(parent, text, command):
+            return tk.Button(
+                parent,
+                text=text,
+                command=command,
+                bg="#1f1e1f",
+                fg="white",
+                font=self.button_font,
+                relief=tk.FLAT,
+                bd=0,
+                padx=16,
+                pady=8,
+                cursor="hand2",
+                activebackground="#2a2a2a",
+                activeforeground="white",
+                highlightthickness=0
+            )
         
         # Left side buttons
-        left_buttons = tk.Frame(input_toolbar)
-        left_buttons.pack(side=tk.LEFT)
+        create_dark_button(left_frame, "📁 Load from File", self.load_file).pack(
+            side=tk.LEFT, padx=(0, 2), pady=2
+        )
         
-        ttk.Button(
-            left_buttons,
-            text="📁 Load from File",
-            command=self.load_file
-        ).pack(side=tk.LEFT, padx=2)
-        
-        ttk.Button(
-            left_buttons,
-            text="🗑️ Clear",
-            command=self.clear_input
-        ).pack(side=tk.LEFT, padx=2)
-        
-        ttk.Button(
-            left_buttons,
-            text="📋 Paste Example",
-            command=self.load_example
-        ).pack(side=tk.LEFT, padx=2)
-        
-        # Right side - ADB controls
-        adb_frame = tk.Frame(input_toolbar)
-        adb_frame.pack(side=tk.RIGHT)
-        
+        create_dark_button(left_frame, "🗑️ Clear", self.clear_input).pack(
+            side=tk.LEFT, padx=2, pady=2
+        )
+
+        # Right side - Device controls, flush after Clear button
+        self.detect_btn = create_dark_button(
+            right_frame,
+            "🔍 Detect Device",
+            self.detect_devices
+        )
+        self.detect_btn.pack(side=tk.LEFT, padx=2, pady=2)
+
+        self.pull_btn = create_dark_button(
+            right_frame,
+            "📱 Pull Logs from Device",
+            self.pull_logs
+        )
+        self.pull_btn.pack(side=tk.LEFT, padx=2, pady=2)
+        self.pull_btn.config(state=tk.DISABLED, bg="#1a1a1a", fg="#666666")
+
+        self.device_info_btn = create_dark_button(
+            right_frame,
+            "📊 Get Device Info",
+            self.fetch_device_info
+        )
+        self.device_info_btn.pack(side=tk.LEFT, padx=2, pady=2)
+        self.device_info_btn.config(state=tk.DISABLED, bg="#1a1a1a", fg="#666666")
+
+        # Combobox pinned to far right
         self.device_var = tk.StringVar()
         self.device_combo = ttk.Combobox(
-            adb_frame,
+            combo_frame,
             textvariable=self.device_var,
-            width=25,
-            state='readonly'
+            width=24,
+            state='readonly',
+            font=self.modern_font,
+            style="Dark.TCombobox"
         )
-        self.device_combo.pack(side=tk.LEFT, padx=5)
+        self.device_combo.pack(side=tk.LEFT, padx=(5, 5), pady=2)
         
-        self.detect_btn = ttk.Button(
-            adb_frame,
-            text="🔍 Detect Device",
-            command=self.detect_devices
-        )
-        self.detect_btn.pack(side=tk.LEFT, padx=2)
-        
-        self.pull_btn = ttk.Button(
-            adb_frame,
-            text="📱 Pull Logs from Device",
-            command=self.pull_logs,
-            state=tk.DISABLED
-        )
-        self.pull_btn.pack(side=tk.LEFT, padx=2)
-        
-        self.device_info_btn = ttk.Button(
-            adb_frame,
-            text="📊 Get Device Info",
-            command=self.fetch_device_info,
-            state=tk.DISABLED
-        )
-        self.device_info_btn.pack(side=tk.LEFT, padx=2)
+        # FIX #1 & #4: Input text area - consistent padding, rounded corners
+        input_outer = tk.Frame(self.root, bg="#262526")
+        input_outer.pack(fill=tk.BOTH, expand=True, padx=40, pady=(0, 5))
+
+        input_rf = RoundedFrame(input_outer, bg_color="#1f1e1f", radius=12)
+        input_rf.pack(fill=tk.BOTH, expand=True)
+        input_container = input_rf.inner
         
         self.input_text = scrolledtext.ScrolledText(
-            input_frame,
-            height=12,
-            font=("Courier", 9),
+            input_container,
+            height=8,
+            font=self.mono_font,
             wrap=tk.WORD,
-            bg="#ecf0f1"
+            bg="#1f1e1f",
+            fg="#ffffff",
+            insertbackground="white",
+            relief=tk.FLAT,
+            bd=10,
+            selectbackground="#662d91",
+            selectforeground="white",
+            highlightthickness=0
         )
         self.input_text.pack(fill=tk.BOTH, expand=True)
         
-        main_container.add(input_frame)
+        # ========== DIAGNOSTIC REPORT SECTION ==========
         
-        # Analyze button
-        analyze_frame = tk.Frame(self.root)
-        analyze_frame.pack(fill=tk.X, padx=10)
-        
-        self.analyze_btn = tk.Button(
-            analyze_frame,
-            text="🔍 ANALYZE CRASH",
-            font=("Arial", 12, "bold"),
-            bg="#27ae60",
-            fg="white",
-            activebackground="#229954",
-            activeforeground="white",
-            relief=tk.RAISED,
-            bd=3,
-            cursor="hand2",
-            command=self.analyze_crash
+        output_label = tk.Label(
+            self.root,
+            text="Diagnostic Report",
+            font=("Segoe UI", 12),
+            bg="#262526",
+            fg="white"
         )
-        self.analyze_btn.pack(pady=10, ipadx=20, ipady=10)
+        output_label.pack(anchor=tk.W, padx=19, pady=(10, 5))
         
-        # Output section
-        output_frame = ttk.LabelFrame(main_container, text="📊 Diagnostic Report", padding=10)
+        # FIX #1 & #4: Output text area - consistent padding, rounded corners
+        output_outer = tk.Frame(self.root, bg="#262526")
+        output_outer.pack(fill=tk.BOTH, expand=True, padx=40, pady=(0, 5))
+
+        output_rf = RoundedFrame(output_outer, bg_color="#1f1e1f", radius=12)
+        output_rf.pack(fill=tk.BOTH, expand=True)
+        output_container = output_rf.inner
         
         self.output_text = scrolledtext.ScrolledText(
-            output_frame,
-            height=15,
-            font=("Consolas", 10),
+            output_container,
+            height=8,
+            font=self.mono_font,
             wrap=tk.WORD,
-            bg="#1e1e1e",
-            fg="#d4d4d4",
-            insertbackground="white"
+            bg="#1f1e1f",
+            fg="#ffffff",
+            insertbackground="white",
+            relief=tk.FLAT,
+            bd=10,
+            selectbackground="#662d91",
+            selectforeground="white",
+            highlightthickness=0
         )
         self.output_text.pack(fill=tk.BOTH, expand=True)
         
-        main_container.add(output_frame)
+        # ========== ANALYZE BUTTON ==========
+        # FIX #3: Fixed height container ensures button ALWAYS appears
         
-        # Status bar
+        analyze_outer = tk.Frame(self.root, bg="#262526", height=65)
+        analyze_outer.pack(fill=tk.X, pady=(8, 0))
+        analyze_outer.pack_propagate(False)  # CRITICAL: Maintain height
+        
+        # Center the button
+        analyze_container = tk.Frame(analyze_outer, bg="#262526")
+        analyze_container.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        
+        self.analyze_btn = tk.Button(
+            analyze_container,
+            text="🔍 ANALYZE CRASH",
+            font=("Segoe UI Emoji", 13, "bold"),
+            bg="#662d91",
+            fg="white",
+            activebackground="#7d3aa8",
+            activeforeground="white",
+            relief=tk.FLAT,
+            bd=0,
+            cursor="hand2",
+            command=self.analyze_crash,
+            padx=38,
+            pady=13,
+            highlightthickness=0
+        )
+        self.analyze_btn.pack()
+        
+        # Hover effect
+        def on_enter(e):
+            self.analyze_btn.config(bg="#7d3aa8")
+        
+        def on_leave(e):
+            self.analyze_btn.config(bg="#662d91")
+        
+        self.analyze_btn.bind("<Enter>", on_enter)
+        self.analyze_btn.bind("<Leave>", on_leave)
+        
+        # ========== STATUS BAR ==========
+        
         self.status_bar = tk.Label(
             self.root,
             text="Ready",
-            bd=1,
-            relief=tk.SUNKEN,
+            bd=0,
+            relief=tk.FLAT,
             anchor=tk.W,
-            bg="#ecf0f1",
-            font=("Arial", 9)
+            bg="#1f1e1f",
+            fg="#999999",
+            font=("Segoe UI", 9),
+            padx=10,
+            pady=5
         )
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        # FIX #3 & #5: Force complete layout update
+        self.root.update_idletasks()
+        
+        # Set geometry to ensure proper sizing
+        self.root.geometry("1080x890")
+    
+    def _enable_button(self, button):
+        """Enable a dark-themed button"""
+        button.config(state=tk.NORMAL, bg="#1f1e1f", fg="white")
+    
+    def _disable_button(self, button):
+        """Disable a dark-themed button"""
+        button.config(state=tk.DISABLED, bg="#1a1a1a", fg="#666666")
         
     def load_file(self):
         """Load crash log from file"""
@@ -1513,8 +1683,8 @@ class PyTombGUI:
                 )
                 self.status_bar.config(text="No devices found")
                 self.device_combo.set("No device found")
-                self.pull_btn.config(state=tk.DISABLED)
-                self.device_info_btn.config(state=tk.DISABLED)
+                self._disable_button(self.pull_btn)
+                self._disable_button(self.device_info_btn)
             elif devices[0].startswith('UNAUTHORIZED:'):
                 # Device found but not authorized
                 device_ids = devices[0].replace('UNAUTHORIZED:', '')
@@ -1530,14 +1700,14 @@ class PyTombGUI:
                 )
                 self.status_bar.config(text="⚠️ Device found but not authorized - check your phone!")
                 self.device_combo.set(f"⚠️ {device_ids} (UNAUTHORIZED)")
-                self.pull_btn.config(state=tk.DISABLED)
-                self.device_info_btn.config(state=tk.DISABLED)
+                self._disable_button(self.pull_btn)
+                self._disable_button(self.device_info_btn)
             else:
                 self.connected_devices = devices
                 self.device_combo['values'] = devices
                 self.device_combo.current(0)
-                self.pull_btn.config(state=tk.NORMAL)
-                self.device_info_btn.config(state=tk.NORMAL)  # Enable device info button
+                self._enable_button(self.pull_btn)
+                self._enable_button(self.device_info_btn)
                 
                 if len(devices) == 1:
                     self.status_bar.config(text=f"✓ Found 1 device: {devices[0]}")
@@ -2069,7 +2239,7 @@ class PyTombGUI:
     
     def highlight_output(self):
         """Apply syntax highlighting to output"""
-        self.output_text.tag_config("emoji", font=("Segoe UI Emoji", 12))
+        self.output_text.tag_config("emoji", font=("Segoe UI Emoji", 13))
         self.output_text.tag_config("header", foreground="#61afef", font=("Consolas", 11, "bold"))
         self.output_text.tag_config("component", foreground="#e06c75", font=("Consolas", 10, "bold"))
         self.output_text.tag_config("confidence_high", foreground="#98c379")
