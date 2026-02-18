@@ -1,7 +1,4 @@
 # 🪦 PyTomb v2.0 — Android Crash Diagnostics Tool
-
-**Turn Android kernel chaos into clear, actionable diagnostics in seconds.**
-
 PyTomb is a standalone GUI application that pulls crash logs directly from connected Android devices and identifies the root cause of failures, crashes, and reboots.
 ---
 <img width="1076" height="890" alt="Screenshot 2026-02-18 191309" src="https://github.com/user-attachments/assets/b1cf61dc-148e-4f4b-b901-b9fc51e70012" />
